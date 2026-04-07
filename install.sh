@@ -47,10 +47,14 @@ fetch_public_ip() {
     if [[ -z "${PUBLIC_IP:-}" ]]; then
         PUBLIC_IP=$(curl -s4 --connect-timeout 3 ipv4.icanhazip.com 2>/dev/null || curl -s4 --connect-timeout 3 ifconfig.me 2>/dev/null || true)
         if [[ ! "$PUBLIC_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-            read -r -p "自动获取公网 IPv4 失败，请手动输入: " PUBLIC_IP </dev/tty
-            if [[ ! "$PUBLIC_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-                die "您输入的 IP 格式不合法，部署已阻断。"
-            fi
+            while true; do
+                read -r -p "自动获取公网 IPv4 失败，请手动输入: " PUBLIC_IP </dev/tty
+                if [[ "$PUBLIC_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+                    break
+                else
+                    err "IP 格式不合法，请重新输入。"
+                fi
+            done
         fi
     fi
 }
@@ -100,7 +104,7 @@ check_singbox_version() {
 check_port_free() {
     local port=$1
     if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
-        err "端口格式非法: $port"
+        err "端口格式非法: ${port:-为空}"
         return 1
     fi
     if ss -tuln | grep ":$port " >/dev/null 2>&1; then
@@ -300,10 +304,17 @@ atomic_inject() {
 
 # ================= 高维协议装载器 =================
 deploy_vless_reality() {
-    read -r -p "请输入监听端口: " port </dev/tty
-    check_port_free "$port" || return
-    read -r -p "请输入 SNI 域名 (如 www.apple.com): " sni </dev/tty
-    [[ -z "$sni" ]] && return
+    local port
+    while true; do
+        read -r -p "请输入监听端口: " port </dev/tty
+        if check_port_free "$port"; then break; fi
+    done
+    
+    local sni
+    while true; do
+        read -r -p "请输入 SNI 域名 (如 www.apple.com): " sni </dev/tty
+        if [[ -n "$sni" ]]; then break; else err "SNI 不能为空，请重新输入。"; fi
+    done
 
     fetch_public_ip
     local uuid; uuid=$(uuidgen)
@@ -322,10 +333,17 @@ deploy_vless_reality() {
 }
 
 deploy_vless_ws() {
-    read -r -p "请输入监听端口: " port </dev/tty
-    check_port_free "$port" || return
-    read -r -p "请输入真实域名 (需解析至本机): " domain </dev/tty
-    [[ -z "$domain" ]] && return
+    local port
+    while true; do
+        read -r -p "请输入监听端口: " port </dev/tty
+        if check_port_free "$port"; then break; fi
+    done
+    
+    local domain
+    while true; do
+        read -r -p "请输入真实域名 (需解析至本机): " domain </dev/tty
+        if [[ -n "$domain" ]]; then break; else err "域名不能为空，请重新输入。"; fi
+    done
 
     apply_cert "$domain" || return
 
@@ -348,10 +366,17 @@ deploy_vless_ws() {
 deploy_anytls() {
     check_singbox_version "1.12.0" || return
 
-    read -r -p "请输入 TLS 监听端口: " port </dev/tty
-    check_port_free "$port" || return
-    read -r -p "请输入绑定域名 (需解析至本机): " domain </dev/tty
-    [[ -z "$domain" ]] && return
+    local port
+    while true; do
+        read -r -p "请输入 TLS 监听端口: " port </dev/tty
+        if check_port_free "$port"; then break; fi
+    done
+    
+    local domain
+    while true; do
+        read -r -p "请输入绑定域名 (需解析至本机): " domain </dev/tty
+        if [[ -n "$domain" ]]; then break; else err "域名不能为空，请重新输入。"; fi
+    done
 
     apply_cert "$domain" || return
 
@@ -368,10 +393,17 @@ deploy_anytls() {
 }
 
 deploy_hysteria2() {
-    read -r -p "请输入 UDP 监听端口: " port </dev/tty
-    check_port_free "$port" || return
-    read -r -p "请输入真实域名 (需解析至本机): " domain </dev/tty
-    [[ -z "$domain" ]] && return
+    local port
+    while true; do
+        read -r -p "请输入 UDP 监听端口: " port </dev/tty
+        if check_port_free "$port"; then break; fi
+    done
+    
+    local domain
+    while true; do
+        read -r -p "请输入真实域名 (需解析至本机): " domain </dev/tty
+        if [[ -n "$domain" ]]; then break; else err "域名不能为空，请重新输入。"; fi
+    done
 
     apply_cert "$domain" || return
 
@@ -389,10 +421,17 @@ deploy_hysteria2() {
 }
 
 deploy_tuic() {
-    read -r -p "请输入 UDP 监听端口: " port </dev/tty
-    check_port_free "$port" || return
-    read -r -p "请输入真实域名 (需解析至本机): " domain </dev/tty
-    [[ -z "$domain" ]] && return
+    local port
+    while true; do
+        read -r -p "请输入 UDP 监听端口: " port </dev/tty
+        if check_port_free "$port"; then break; fi
+    done
+    
+    local domain
+    while true; do
+        read -r -p "请输入真实域名 (需解析至本机): " domain </dev/tty
+        if [[ -n "$domain" ]]; then break; else err "域名不能为空，请重新输入。"; fi
+    done
 
     apply_cert "$domain" || return
 
@@ -415,12 +454,22 @@ deploy_trojan() {
     echo "  1) TCP + TLS"
     echo "  2) WS + TLS"
     local t_choice
-    read -r -p "请选择 [1-2]: " t_choice </dev/tty
+    while true; do
+        read -r -p "请选择 [1-2]: " t_choice </dev/tty
+        if [[ "$t_choice" =~ ^[1-2]$ ]]; then break; else err "输入错误，请重试。"; fi
+    done
     
-    read -r -p "请输入监听端口: " port </dev/tty
-    check_port_free "$port" || return
-    read -r -p "请输入真实域名 (需解析至本机): " domain </dev/tty
-    [[ -z "$domain" ]] && return
+    local port
+    while true; do
+        read -r -p "请输入监听端口: " port </dev/tty
+        if check_port_free "$port"; then break; fi
+    done
+    
+    local domain
+    while true; do
+        read -r -p "请输入真实域名 (需解析至本机): " domain </dev/tty
+        if [[ -n "$domain" ]]; then break; else err "域名不能为空，请重新输入。"; fi
+    done
 
     apply_cert "$domain" || return
 
@@ -457,8 +506,12 @@ deploy_shadowsocks() {
     echo "  4) aes-128-gcm"
     echo "  5) aes-256-gcm"
     echo "  6) chacha20-poly1305"
+    
     local ss_choice
-    read -r -p "请选择 [1-6]: " ss_choice </dev/tty
+    while true; do
+        read -r -p "请选择 [1-6]: " ss_choice </dev/tty
+        if [[ "$ss_choice" =~ ^[1-6]$ ]]; then break; else err "输入错误，请重新选择。"; fi
+    done
 
     local method=""
     local pass=""
@@ -470,11 +523,13 @@ deploy_shadowsocks() {
         4) method="aes-128-gcm"; pass=$(openssl rand -base64 16) ;;
         5) method="aes-256-gcm"; pass=$(openssl rand -base64 32) ;;
         6) method="chacha20-poly1305"; pass=$(openssl rand -base64 32) ;;
-        *) warn "输入错误。"; return ;;
     esac
 
-    read -r -p "请输入监听端口: " port </dev/tty
-    check_port_free "$port" || return
+    local port
+    while true; do
+        read -r -p "请输入监听端口: " port </dev/tty
+        if check_port_free "$port"; then break; fi
+    done
 
     fetch_public_ip
     local tag="SS-$port"
@@ -501,10 +556,16 @@ deploy_vmess() {
     echo "  1) TCP"
     echo "  2) WS + TLS"
     local v_choice
-    read -r -p "请选择 [1-2]: " v_choice </dev/tty
+    while true; do
+        read -r -p "请选择 [1-2]: " v_choice </dev/tty
+        if [[ "$v_choice" =~ ^[1-2]$ ]]; then break; else err "输入错误，请重试。"; fi
+    done
 
-    read -r -p "请输入监听端口: " port </dev/tty
-    check_port_free "$port" || return
+    local port
+    while true; do
+        read -r -p "请输入监听端口: " port </dev/tty
+        if check_port_free "$port"; then break; fi
+    done
 
     local uuid; uuid=$(uuidgen)
     local tag="VMess-$port"
@@ -512,8 +573,12 @@ deploy_vmess() {
     local link=""
 
     if [[ "$v_choice" == "2" ]]; then
-        read -r -p "请输入绑定域名 (需解析至本机): " domain </dev/tty
-        [[ -z "$domain" ]] && return
+        local domain
+        while true; do
+            read -r -p "请输入绑定域名 (需解析至本机): " domain </dev/tty
+            if [[ -n "$domain" ]]; then break; else err "域名不能为空，请重新输入。"; fi
+        done
+        
         apply_cert "$domain" || return
         
         local path="/$(openssl rand -hex 6)"
@@ -553,18 +618,30 @@ deploy_mixed() {
     echo "系统将强制附加鉴权机制或限制为本地监听。"
     echo "  1) 绑定至 localhost (127.0.0.1) 仅供内部进程调用"
     echo "  2) 开放至公网 (::) 但强制要求用户名/密码"
-    local m_choice
-    read -r -p "请选择策略 [1-2]: " m_choice </dev/tty
     
-    read -r -p "请输入监听端口: " port </dev/tty
-    check_port_free "$port" || return
+    local m_choice
+    while true; do
+        read -r -p "请选择策略 [1-2]: " m_choice </dev/tty
+        if [[ "$m_choice" =~ ^[1-2]$ ]]; then break; else err "输入错误，请重新选择。"; fi
+    done
+    
+    local port
+    while true; do
+        read -r -p "请输入监听端口: " port </dev/tty
+        if check_port_free "$port"; then break; fi
+    done
 
     local tag="Mixed-$port"
     local json=""
     local link=""
 
     if [[ "$m_choice" == "2" ]]; then
-        read -r -p "请输入鉴权用户名: " m_user </dev/tty
+        local m_user
+        while true; do
+            read -r -p "请输入鉴权用户名: " m_user </dev/tty
+            if [[ -n "$m_user" ]]; then break; else err "用户名不能为空。"; fi
+        done
+        
         local m_pass; m_pass=$(openssl rand -hex 6)
         info "已为您自动生成随机鉴权密码: $m_pass"
         fetch_public_ip
@@ -584,10 +661,17 @@ deploy_mixed() {
 }
 
 deploy_naive() {
-    read -r -p "请输入监听端口: " port </dev/tty
-    check_port_free "$port" || return
-    read -r -p "请输入绑定域名 (需解析至本机): " domain </dev/tty
-    [[ -z "$domain" ]] && return
+    local port
+    while true; do
+        read -r -p "请输入监听端口: " port </dev/tty
+        if check_port_free "$port"; then break; fi
+    done
+    
+    local domain
+    while true; do
+        read -r -p "请输入绑定域名 (需解析至本机): " domain </dev/tty
+        if [[ -n "$domain" ]]; then break; else err "域名不能为空。"; fi
+    done
 
     apply_cert "$domain" || return
 
@@ -609,14 +693,24 @@ deploy_shadowtls() {
     check_singbox_version "1.8.0" || return
     info "ShadowTLS 为链式协议，将自动在后台构建隐藏的 SS 2022 解密端。"
     
-    read -r -p "请输入 ShadowTLS 公网监听端口: " port </dev/tty
-    check_port_free "$port" || return
-    read -r -p "请输入待寄生的白名单目标 (如 www.apple.com): " sni </dev/tty
-    [[ -z "$sni" ]] && return
+    local port
+    while true; do
+        read -r -p "请输入 ShadowTLS 公网监听端口: " port </dev/tty
+        if check_port_free "$port"; then break; fi
+    done
+    
+    local sni
+    while true; do
+        read -r -p "请输入待寄生的白名单目标 (如 www.apple.com): " sni </dev/tty
+        if [[ -n "$sni" ]]; then break; else err "寄生目标不能为空。"; fi
+    done
 
     fetch_public_ip
-    local internal_port=$((RANDOM % 10000 + 40000))
-    check_port_free "$internal_port" || return
+    local internal_port
+    while true; do
+        internal_port=$((RANDOM % 10000 + 40000))
+        if check_port_free "$internal_port"; then break; fi
+    done
     
     local stls_pass; stls_pass=$(openssl rand -hex 8)
     local ss_pass; ss_pass=$(openssl rand -base64 16)
@@ -664,14 +758,16 @@ list_nodes() {
             fi
         done < "$LINK_DB"
     fi
-    read -r -p "➤ 按回车键返回..." </dev/tty
 }
 
 delete_node() {
     jq -r '.inbounds[] | select(.tag | startswith("SS-Internal-") | not) | " [\(.type)] 标签: \(.tag)"' "$CONF_FILE" 2>/dev/null || true
     local t
-    read -r -p "请输入要删除的节点标签: " t </dev/tty
-    [[ -z "$t" ]] && return
+    while true; do
+        read -r -p "请输入要删除的节点标签 (输入 0 退出): " t </dev/tty
+        if [[ "$t" == "0" ]]; then return; fi
+        if [[ -n "$t" ]]; then break; else err "标签不能为空。"; fi
+    done
 
     if [[ "$t" == SS-Internal-* ]]; then
         err "越权操作：禁止直接物理剥离内部级联资产。"
@@ -722,7 +818,6 @@ uninstall_core() {
         return
     fi
     
-    # 真正的 DevOps 物理级清场：解除进程托管，抹除执行体
     systemctl stop sing-box >/dev/null 2>&1 || true
     systemctl disable sing-box >/dev/null 2>&1 || true
     
@@ -743,9 +838,8 @@ uninstall_core() {
         rm -rf "$ACME_DIR"
     fi
 
-    # 针对核心安装的依赖进行拔除
     local dep_confirm
-    read -r -p "是否同步卸载 jq, qrencode, socat, uuidgen 等由于安装核心附带的基础依赖？(若其他软件需要请选N) (y/N): " dep_confirm </dev/tty
+    read -r -p "是否同步卸载 jq, qrencode, socat, uuidgen 等基础依赖？(若其他软件需要请选N) (y/N): " dep_confirm </dev/tty
     if [[ "$dep_confirm" =~ ^[Yy]$ ]]; then
         if command -v apt-get >/dev/null 2>&1; then
             apt-get remove -y jq qrencode socat uuid-runtime >/dev/null 2>&1 || true
@@ -789,29 +883,78 @@ main_menu() {
     local choice
     read -r -p "请输入序号 [0-15]: " choice </dev/tty
     case "$choice" in
-        1) install_singbox ; read -r -p "➤ 按回车键返回..." </dev/tty ;;
-        2) check_singbox_installed && deploy_vless_reality ; read -r -p "➤ 按回车键返回..." </dev/tty ;;
-        3) check_singbox_installed && deploy_vless_ws ; read -r -p "➤ 按回车键返回..." </dev/tty ;;
-        4) check_singbox_installed && deploy_anytls ; read -r -p "➤ 按回车键返回..." </dev/tty ;;
-        5) check_singbox_installed && deploy_hysteria2 ; read -r -p "➤ 按回车键返回..." </dev/tty ;;
-        6) check_singbox_installed && deploy_tuic ; read -r -p "➤ 按回车键返回..." </dev/tty ;;
-        7) check_singbox_installed && deploy_trojan ; read -r -p "➤ 按回车键返回..." </dev/tty ;;
-        8) check_singbox_installed && deploy_shadowsocks ; read -r -p "➤ 按回车键返回..." </dev/tty ;;
-        9) check_singbox_installed && deploy_vmess ; read -r -p "➤ 按回车键返回..." </dev/tty ;;
-        10) check_singbox_installed && deploy_mixed ; read -r -p "➤ 按回车键返回..." </dev/tty ;;
-        11) check_singbox_installed && deploy_naive ; read -r -p "➤ 按回车键返回..." </dev/tty ;;
-        12) check_singbox_installed && deploy_shadowtls ; read -r -p "➤ 按回车键返回..." </dev/tty ;;
-        13) check_singbox_installed && list_nodes ;;
-        14) check_singbox_installed && delete_node ; sleep 1 ;;
-        15) uninstall_core ; read -r -p "➤ 按回车键返回..." </dev/tty ;;
-        0) exit 0 ;;
-        *) warn "无效输入" ; sleep 1 ;;
+        1) 
+            install_singbox 
+            read -r -p "➤ 按回车键返回..." </dev/tty 
+            ;;
+        2) 
+            if check_singbox_installed; then deploy_vless_reality; fi
+            read -r -p "➤ 按回车键返回..." </dev/tty 
+            ;;
+        3) 
+            if check_singbox_installed; then deploy_vless_ws; fi
+            read -r -p "➤ 按回车键返回..." </dev/tty 
+            ;;
+        4) 
+            if check_singbox_installed; then deploy_anytls; fi
+            read -r -p "➤ 按回车键返回..." </dev/tty 
+            ;;
+        5) 
+            if check_singbox_installed; then deploy_hysteria2; fi
+            read -r -p "➤ 按回车键返回..." </dev/tty 
+            ;;
+        6) 
+            if check_singbox_installed; then deploy_tuic; fi
+            read -r -p "➤ 按回车键返回..." </dev/tty 
+            ;;
+        7) 
+            if check_singbox_installed; then deploy_trojan; fi
+            read -r -p "➤ 按回车键返回..." </dev/tty 
+            ;;
+        8) 
+            if check_singbox_installed; then deploy_shadowsocks; fi
+            read -r -p "➤ 按回车键返回..." </dev/tty 
+            ;;
+        9) 
+            if check_singbox_installed; then deploy_vmess; fi
+            read -r -p "➤ 按回车键返回..." </dev/tty 
+            ;;
+        10) 
+            if check_singbox_installed; then deploy_mixed; fi
+            read -r -p "➤ 按回车键返回..." </dev/tty 
+            ;;
+        11) 
+            if check_singbox_installed; then deploy_naive; fi
+            read -r -p "➤ 按回车键返回..." </dev/tty 
+            ;;
+        12) 
+            if check_singbox_installed; then deploy_shadowtls; fi
+            read -r -p "➤ 按回车键返回..." </dev/tty 
+            ;;
+        13) 
+            if check_singbox_installed; then list_nodes; fi
+            read -r -p "➤ 按回车键返回..." </dev/tty 
+            ;;
+        14) 
+            if check_singbox_installed; then delete_node; fi
+            read -r -p "➤ 按回车键返回..." </dev/tty 
+            ;;
+        15) 
+            uninstall_core 
+            read -r -p "➤ 按回车键返回..." </dev/tty 
+            ;;
+        0) 
+            exit 0 
+            ;;
+        *) 
+            warn "无效输入" 
+            sleep 1 
+            ;;
     esac
 }
 
 if [[ $EUID -ne 0 ]]; then die "权限不足：请使用 root 权限。"; fi
 
-# 仅在后台构建空的环境架子（取消了强制卡进程的错误校验），让用户平滑过渡到菜单
 init_env 
 
 while true; do main_menu; done
