@@ -32,7 +32,7 @@ require_cmd() {
 
         if command -v apt-get >/dev/null 2>&1; then
             export DEBIAN_FRONTEND=noninteractive
-            apt-get update -qq >/dev/null 2>&1
+            apt-get update -qq >/dev/null 2>&1 || true
             apt-get install -y -qq "$pkg_name" >/dev/null 2>&1
         elif command -v yum >/dev/null 2>&1; then
             yum install -y -q "$pkg_name" >/dev/null 2>&1
@@ -56,18 +56,6 @@ fetch_public_ip() {
 }
 
 init_env() {
-    require_cmd jq
-    require_cmd curl
-    require_cmd openssl
-    require_cmd uuidgen
-    require_cmd qrencode
-    require_cmd socat
-    require_cmd ss
-
-    if ! command -v sing-box >/dev/null 2>&1; then
-        die "未检测到 sing-box 内核。请先完成底层内核安装。"
-    fi
-
     mkdir -p "$CONF_DIR" "$CERT_DIR"
     touch "$LINK_DB"
     chmod 600 "$LINK_DB" 2>/dev/null || true
@@ -85,6 +73,14 @@ init_env() {
 EOF
     fi
     chmod 600 "$CONF_FILE" 2>/dev/null || true
+}
+
+check_singbox_installed() {
+    if ! command -v sing-box >/dev/null 2>&1; then
+        err "未检测到 sing-box 内核。请先在主菜单输入 [1] 进行内核与依赖安装。"
+        return 1
+    fi
+    return 0
 }
 
 check_singbox_version() {
@@ -112,6 +108,75 @@ check_port_free() {
         return 1
     fi
     return 0
+}
+
+# ================= 安装与环境装配核心 =================
+install_singbox() {
+    info "开始装载基础依赖组件..."
+    require_cmd curl
+    require_cmd jq
+    require_cmd openssl
+    require_cmd uuidgen
+    require_cmd qrencode
+    require_cmd socat
+    require_cmd ss
+
+    info "开始拉取 Sing-box 内核..."
+    local arch
+    arch=$(uname -m)
+    local s_arch
+    case "$arch" in
+        x86_64) s_arch="amd64" ;;
+        aarch64) s_arch="arm64" ;;
+        armv7l) s_arch="armv7" ;;
+        *) die "不支持的系统架构: $arch" ;;
+    esac
+
+    local latest_version
+    latest_version=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | jq -r .tag_name | sed 's/v//')
+    if [[ -z "$latest_version" || "$latest_version" == "null" ]]; then
+        err "获取 Sing-box 最新版本失败，请检查服务器网络。"
+        return 1
+    fi
+
+    info "发现最新版本: v$latest_version, 正在下载..."
+    local tar_file="sing-box-${latest_version}-linux-${s_arch}.tar.gz"
+    local download_url="https://github.com/SagerNet/sing-box/releases/download/v${latest_version}/${tar_file}"
+
+    curl -L -o "/tmp/$tar_file" "$download_url" || { err "下载失败"; return 1; }
+    tar -xzf "/tmp/$tar_file" -C "/tmp/" || { err "解压失败"; return 1; }
+
+    systemctl stop sing-box >/dev/null 2>&1 || true
+    mv "/tmp/sing-box-${latest_version}-linux-${s_arch}/sing-box" "/usr/local/bin/"
+    chmod +x "/usr/local/bin/sing-box"
+
+    rm -rf "/tmp/$tar_file" "/tmp/sing-box-${latest_version}-linux-${s_arch}"
+
+    # 配置守护进程
+    cat > /etc/systemd/system/sing-box.service <<EOF
+[Unit]
+Description=sing-box service
+Documentation=https://sing-box.sagernet.org
+After=network.target nss-lookup.target network-online.target
+
+[Service]
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+ExecStart=/usr/local/bin/sing-box run -c $CONF_FILE
+ExecReload=/bin/kill -HUP \$MAINPID
+Restart=on-failure
+RestartSec=10s
+LimitNOFILE=infinity
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable sing-box
+    systemctl restart sing-box
+    
+    info "Sing-box v$latest_version 及依赖环境已成功安装并启动！"
 }
 
 # ================= ACME 自动化证书引擎 =================
@@ -558,7 +623,6 @@ deploy_shadowtls() {
     local ss_method="2022-blake3-aes-128-gcm"
     
     local tag="ShadowTLS-$port"
-    # 添加内部专属标识，在节点展示与删除中进行静默过滤
     local inner_tag="SS-Internal-$internal_port"
 
     local json; json=$(jq -n \
@@ -580,13 +644,12 @@ deploy_shadowtls() {
 list_nodes() {
     clear
     echo "==================================================="
-    echo "                  查看所有节点                     "
+    echo "                 查看所有节点                      "
     echo "==================================================="
     if [[ ! -s "$LINK_DB" ]]; then
         echo " 当前无节点记录。"
     else
         while IFS="|" read -r tag link; do
-            # 严格防范内部附属节点泄露到前端 UI
             if [[ "$tag" == SS-Internal-* ]]; then
                 continue
             fi
@@ -621,7 +684,6 @@ delete_node() {
         
         jq --arg tag "$t" 'del(.inbounds[] | select(.tag == $tag))' "$CONF_FILE" > "$tmp_conf"
         
-        # 兼容 ShadowTLS 链式删除：查找是否有通过 detour 关联的内部节点并一并摘除
         local inner_tag
         inner_tag=$(jq -r --arg tag "$t" '.inbounds[] | select(.tag == $tag) | .detour // empty' "$CONF_FILE" 2>/dev/null || true)
         if [[ -n "$inner_tag" ]]; then
@@ -680,6 +742,19 @@ uninstall_core() {
         "$ACME_DIR/acme.sh" --uninstall >/dev/null 2>&1 || true
         rm -rf "$ACME_DIR"
     fi
+
+    # 针对核心安装的依赖进行拔除
+    local dep_confirm
+    read -r -p "是否同步卸载 jq, qrencode, socat, uuidgen 等由于安装核心附带的基础依赖？(若其他软件需要请选N) (y/N): " dep_confirm </dev/tty
+    if [[ "$dep_confirm" =~ ^[Yy]$ ]]; then
+        if command -v apt-get >/dev/null 2>&1; then
+            apt-get remove -y jq qrencode socat uuid-runtime >/dev/null 2>&1 || true
+            apt-get autoremove -y >/dev/null 2>&1 || true
+        elif command -v yum >/dev/null 2>&1; then
+            yum remove -y jq qrencode socat util-linux >/dev/null 2>&1 || true
+        fi
+        info "基础依赖组件已被清理。"
+    fi
     
     info "基础设施已彻底销毁，系统已恢复洁净。"
     exit 0
@@ -689,49 +764,54 @@ uninstall_core() {
 main_menu() {
     clear
     echo "==================================================="
-    echo "                  Sing-box 一键管理                "
+    echo "                 Sing-box 一键管理                 "
     echo "==================================================="
     echo -e " 核心配置: \033[36m$CONF_FILE\033[0m"
     echo "---------------------------------------------------"
-    echo "  1) 一键部署 VLESS-Reality"
-    echo "  2) 一键部署 VLESS-WS"
-    echo "  3) 一键部署 AnyTLS"
-    echo "  4) 一键部署 Hysteria2"
-    echo "  5) 一键部署 TUIC v5"
-    echo "  6) 一键部署 Trojan"
-    echo "  7) 一键部署 Shadowsocks"
-    echo "  8) 一键部署 VMess"
-    echo "  9) 一键部署 Mixed (HTTP/SOCKS)"
-    echo " 10) 一键部署 NaiveProxy"
-    echo " 11) 一键部署 ShadowTLS"
-    echo " 12) 查看所有节点"
-    echo " 13) 删除指定节点"
-    echo " 14) 完全卸载"
+    echo "  1) 安装/更新 Sing-box"
+    echo "  2) 一键部署 VLESS-Reality"
+    echo "  3) 一键部署 VLESS-WS"
+    echo "  4) 一键部署 AnyTLS"
+    echo "  5) 一键部署 Hysteria2"
+    echo "  6) 一键部署 TUIC v5"
+    echo "  7) 一键部署 Trojan"
+    echo "  8) 一键部署 Shadowsocks"
+    echo "  9) 一键部署 VMess"
+    echo " 10) 一键部署 Mixed (HTTP/SOCKS)"
+    echo " 11) 一键部署 NaiveProxy"
+    echo " 12) 一键部署 ShadowTLS"
+    echo " 13) 查看所有节点"
+    echo " 14) 删除指定节点"
+    echo " 15) 完全卸载"
     echo "  0) 退出脚本"
     echo "==================================================="
     
     local choice
-    read -r -p "请输入序号 [0-14]: " choice </dev/tty
+    read -r -p "请输入序号 [0-15]: " choice </dev/tty
     case "$choice" in
-        1) deploy_vless_reality ; read -r -p "➤ 按回车键返回..." </dev/tty ;;
-        2) deploy_vless_ws ; read -r -p "➤ 按回车键返回..." </dev/tty ;;
-        3) deploy_anytls ; read -r -p "➤ 按回车键返回..." </dev/tty ;;
-        4) deploy_hysteria2 ; read -r -p "➤ 按回车键返回..." </dev/tty ;;
-        5) deploy_tuic ; read -r -p "➤ 按回车键返回..." </dev/tty ;;
-        6) deploy_trojan ; read -r -p "➤ 按回车键返回..." </dev/tty ;;
-        7) deploy_shadowsocks ; read -r -p "➤ 按回车键返回..." </dev/tty ;;
-        8) deploy_vmess ; read -r -p "➤ 按回车键返回..." </dev/tty ;;
-        9) deploy_mixed ; read -r -p "➤ 按回车键返回..." </dev/tty ;;
-        10) deploy_naive ; read -r -p "➤ 按回车键返回..." </dev/tty ;;
-        11) deploy_shadowtls ; read -r -p "➤ 按回车键返回..." </dev/tty ;;
-        12) list_nodes ;;
-        13) delete_node ; sleep 1 ;;
-        14) uninstall_core ; read -r -p "➤ 按回车键返回..." </dev/tty ;;
+        1) install_singbox ; read -r -p "➤ 按回车键返回..." </dev/tty ;;
+        2) check_singbox_installed && deploy_vless_reality ; read -r -p "➤ 按回车键返回..." </dev/tty ;;
+        3) check_singbox_installed && deploy_vless_ws ; read -r -p "➤ 按回车键返回..." </dev/tty ;;
+        4) check_singbox_installed && deploy_anytls ; read -r -p "➤ 按回车键返回..." </dev/tty ;;
+        5) check_singbox_installed && deploy_hysteria2 ; read -r -p "➤ 按回车键返回..." </dev/tty ;;
+        6) check_singbox_installed && deploy_tuic ; read -r -p "➤ 按回车键返回..." </dev/tty ;;
+        7) check_singbox_installed && deploy_trojan ; read -r -p "➤ 按回车键返回..." </dev/tty ;;
+        8) check_singbox_installed && deploy_shadowsocks ; read -r -p "➤ 按回车键返回..." </dev/tty ;;
+        9) check_singbox_installed && deploy_vmess ; read -r -p "➤ 按回车键返回..." </dev/tty ;;
+        10) check_singbox_installed && deploy_mixed ; read -r -p "➤ 按回车键返回..." </dev/tty ;;
+        11) check_singbox_installed && deploy_naive ; read -r -p "➤ 按回车键返回..." </dev/tty ;;
+        12) check_singbox_installed && deploy_shadowtls ; read -r -p "➤ 按回车键返回..." </dev/tty ;;
+        13) check_singbox_installed && list_nodes ;;
+        14) check_singbox_installed && delete_node ; sleep 1 ;;
+        15) uninstall_core ; read -r -p "➤ 按回车键返回..." </dev/tty ;;
         0) exit 0 ;;
         *) warn "无效输入" ; sleep 1 ;;
     esac
 }
 
 if [[ $EUID -ne 0 ]]; then die "权限不足：请使用 root 权限。"; fi
-init_env
+
+# 仅在后台构建空的环境架子（取消了强制卡进程的错误校验），让用户平滑过渡到菜单
+init_env 
+
 while true; do main_menu; done
