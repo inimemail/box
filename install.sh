@@ -114,6 +114,25 @@ check_port_free() {
     return 0
 }
 
+ask_for_tag() {
+    local default_tag=$1
+    while true; do
+        read -r -p "请输入自定义节点名称(标签) [回车默认: $default_tag]: " RET_TAG </dev/tty
+        [[ -z "$RET_TAG" ]] && RET_TAG="$default_tag"
+        
+        if [[ "$RET_TAG" == *"|"* ]]; then
+            err "节点名称不能包含 '|' 字符，请重新输入。"
+            continue
+        fi
+        
+        if jq -e --arg t "$RET_TAG" '.inbounds[] | select(.tag == $t)' "$CONF_FILE" >/dev/null 2>&1; then
+            err "当前配置中已存在同名节点 [$RET_TAG]，请换一个名称。"
+        else
+            break
+        fi
+    done
+}
+
 # ================= 安装与环境装配核心 =================
 install_singbox() {
     info "开始装载基础依赖组件..."
@@ -156,7 +175,6 @@ install_singbox() {
 
     rm -rf "/tmp/$tar_file" "/tmp/sing-box-${latest_version}-linux-${s_arch}"
 
-    # 配置守护进程
     cat > /etc/systemd/system/sing-box.service <<EOF
 [Unit]
 Description=sing-box service
@@ -234,7 +252,6 @@ apply_cert() {
         return 1
     }
     
-    # 严格检验剥离写入与重载过程，拒绝吞噬异常
     "$acme_bin" --install-cert -d "$domain" --ecc \
         --key-file "$CERT_DIR/${domain}.key" \
         --fullchain-file "$CERT_DIR/${domain}.crt" \
@@ -255,11 +272,6 @@ atomic_inject() {
     local tag=$1
     local safe_json=$2
     local link=$3
-
-    if jq -e --arg t "$tag" '.inbounds[] | select(.tag == $t)' "$CONF_FILE" >/dev/null 2>&1; then
-        err "规则冲突：主标签 [$tag] 已存在。"
-        return 1
-    fi
 
     local tmp_conf="${CONF_FILE}.tmp"
     cp -a "$CONF_FILE" "$tmp_conf"
@@ -295,6 +307,7 @@ atomic_inject() {
     
     echo -e "\n=================================================="
     info "部署完成！"
+    echo -e "节点标签: \033[33m$tag\033[0m"
     echo -e "分享链接: \033[36m$link\033[0m"
     if [[ "$link" =~ ^(vless|hysteria2|tuic|trojan|ss|vmess|naive):// ]]; then
         qrencode -t UTF8 "$link" 2>/dev/null || true
@@ -316,19 +329,21 @@ deploy_vless_reality() {
         if [[ -n "$sni" ]]; then break; else err "SNI 不能为空，请重新输入。"; fi
     done
 
+    ask_for_tag "VLESS-Reality-$port"
+    local tag="$RET_TAG"
+
     fetch_public_ip
     local uuid; uuid=$(uuidgen)
     local keypair; keypair=$(sing-box generate reality-keypair)
     local priv; priv=$(echo "$keypair" | awk '/PrivateKey/ {print $2}')
     local pub; pub=$(echo "$keypair" | awk '/PublicKey/ {print $2}')
     local sid; sid=$(openssl rand -hex 8)
-    local tag="VLESS-Reality-$port"
 
     local json; json=$(jq -n \
         --arg tag "$tag" --arg port "$port" --arg uuid "$uuid" --arg sni "$sni" --arg priv "$priv" --arg sid "$sid" \
         '{type: "vless", tag: $tag, listen: "::", listen_port: ($port|tonumber), users: [{uuid: $uuid, flow: "xtls-rprx-vision"}], tls: {enabled: true, server_name: $sni, reality: {enabled: true, handshake: {server: $sni, server_port: 443}, private_key: $priv, short_id: [$sid]}}}')
     
-    local link="vless://${uuid}@${PUBLIC_IP}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pub}&sid=${sid}&type=tcp#${tag}"
+    local link="vless://${uuid}@${PUBLIC_IP}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pub}&sid=${sid}&type=tcp#$(echo -n "$tag" | jq -sRr @uri)"
     atomic_inject "$tag" "$json" "$link"
 }
 
@@ -345,13 +360,15 @@ deploy_vless_ws() {
         if [[ -n "$domain" ]]; then break; else err "域名不能为空，请重新输入。"; fi
     done
 
+    ask_for_tag "VLESS-WS-$port"
+    local tag="$RET_TAG"
+
     apply_cert "$domain" || return
 
     local uuid; uuid=$(uuidgen)
     local path="/$(openssl rand -hex 6)"
     info "已自动分配高匿随机路径: $path"
 
-    local tag="VLESS-WS-$port"
     local crt_path="$CERT_DIR/${domain}.crt"
     local key_path="$CERT_DIR/${domain}.key"
 
@@ -359,7 +376,7 @@ deploy_vless_ws() {
         --arg tag "$tag" --arg port "$port" --arg uuid "$uuid" --arg domain "$domain" --arg path "$path" --arg crt "$crt_path" --arg key "$key_path" \
         '{type: "vless", tag: $tag, listen: "::", listen_port: ($port|tonumber), users: [{uuid: $uuid}], transport: {type: "ws", path: $path, headers: {"Host": $domain}}, tls: {enabled: true, server_name: $domain, certificate_path: $crt, key_path: $key}}')
     
-    local link="vless://${uuid}@${domain}:${port}?encryption=none&security=tls&sni=${domain}&type=ws&host=${domain}&path=$(echo -n "$path" | jq -sRr @uri)#${tag}"
+    local link="vless://${uuid}@${domain}:${port}?encryption=none&security=tls&sni=${domain}&type=ws&host=${domain}&path=$(echo -n "$path" | jq -sRr @uri)#$(echo -n "$tag" | jq -sRr @uri)"
     atomic_inject "$tag" "$json" "$link"
 }
 
@@ -378,10 +395,12 @@ deploy_anytls() {
         if [[ -n "$domain" ]]; then break; else err "域名不能为空，请重新输入。"; fi
     done
 
+    ask_for_tag "AnyTLS-$port"
+    local tag="$RET_TAG"
+
     apply_cert "$domain" || return
 
     local pass; pass=$(openssl rand -hex 12)
-    local tag="AnyTLS-$port"
     local crt_path="$CERT_DIR/${domain}.crt"
     local key_path="$CERT_DIR/${domain}.key"
 
@@ -405,10 +424,12 @@ deploy_hysteria2() {
         if [[ -n "$domain" ]]; then break; else err "域名不能为空，请重新输入。"; fi
     done
 
+    ask_for_tag "Hysteria2-$port"
+    local tag="$RET_TAG"
+
     apply_cert "$domain" || return
 
     local pass; pass=$(openssl rand -hex 12)
-    local tag="Hysteria2-$port"
     local crt_path="$CERT_DIR/${domain}.crt"
     local key_path="$CERT_DIR/${domain}.key"
 
@@ -416,7 +437,7 @@ deploy_hysteria2() {
         --arg tag "$tag" --arg port "$port" --arg pass "$pass" --arg crt "$crt_path" --arg key "$key_path" \
         '{type: "hysteria2", tag: $tag, listen: "::", listen_port: ($port|tonumber), users: [{password: $pass}], tls: {enabled: true, alpn: ["h3"], certificate_path: $crt, key_path: $key}}')
     
-    local link="hysteria2://${pass}@${domain}:${port}/?sni=${domain}#${tag}"
+    local link="hysteria2://${pass}@${domain}:${port}/?sni=${domain}#$(echo -n "$tag" | jq -sRr @uri)"
     atomic_inject "$tag" "$json" "$link"
 }
 
@@ -433,11 +454,13 @@ deploy_tuic() {
         if [[ -n "$domain" ]]; then break; else err "域名不能为空，请重新输入。"; fi
     done
 
+    ask_for_tag "TUIC-$port"
+    local tag="$RET_TAG"
+
     apply_cert "$domain" || return
 
     local uuid; uuid=$(uuidgen)
     local pass; pass=$(openssl rand -hex 8)
-    local tag="TUIC-$port"
     local crt_path="$CERT_DIR/${domain}.crt"
     local key_path="$CERT_DIR/${domain}.key"
 
@@ -445,7 +468,7 @@ deploy_tuic() {
         --arg tag "$tag" --arg port "$port" --arg uuid "$uuid" --arg pass "$pass" --arg crt "$crt_path" --arg key "$key_path" \
         '{type: "tuic", tag: $tag, listen: "::", listen_port: ($port|tonumber), users: [{uuid: $uuid, password: $pass}], congestion_control: "bbr", tls: {enabled: true, alpn: ["h3"], certificate_path: $crt, key_path: $key}}')
     
-    local link="tuic://${uuid}:${pass}@${domain}:${port}/?sni=${domain}&congestion_control=bbr&alpn=h3#${tag}"
+    local link="tuic://${uuid}:${pass}@${domain}:${port}/?sni=${domain}&congestion_control=bbr&alpn=h3#$(echo -n "$tag" | jq -sRr @uri)"
     atomic_inject "$tag" "$json" "$link"
 }
 
@@ -471,28 +494,31 @@ deploy_trojan() {
         if [[ -n "$domain" ]]; then break; else err "域名不能为空，请重新输入。"; fi
     done
 
+    local default_name="Trojan-$port"
+    [[ "$t_choice" == "2" ]] && default_name="Trojan-WS-$port"
+    ask_for_tag "$default_name"
+    local tag="$RET_TAG"
+
     apply_cert "$domain" || return
 
     local pass; pass=$(openssl rand -hex 12)
     local crt_path="$CERT_DIR/${domain}.crt"
     local key_path="$CERT_DIR/${domain}.key"
-    local tag="Trojan-$port"
     local json=""
     local link=""
 
     if [[ "$t_choice" == "2" ]]; then
         local path="/$(openssl rand -hex 6)"
         info "已自动分配高匿随机路径: $path"
-        tag="Trojan-WS-$port"
         json=$(jq -n \
             --arg tag "$tag" --arg port "$port" --arg pass "$pass" --arg domain "$domain" --arg path "$path" --arg crt "$crt_path" --arg key "$key_path" \
             '{type: "trojan", tag: $tag, listen: "::", listen_port: ($port|tonumber), users: [{password: $pass}], transport: {type: "ws", path: $path, headers: {"Host": $domain}}, tls: {enabled: true, server_name: $domain, certificate_path: $crt, key_path: $key}}')
-        link="trojan://${pass}@${domain}:${port}?security=tls&sni=${domain}&type=ws&host=${domain}&path=$(echo -n "$path" | jq -sRr @uri)#${tag}"
+        link="trojan://${pass}@${domain}:${port}?security=tls&sni=${domain}&type=ws&host=${domain}&path=$(echo -n "$path" | jq -sRr @uri)#$(echo -n "$tag" | jq -sRr @uri)"
     else
         json=$(jq -n \
             --arg tag "$tag" --arg port "$port" --arg pass "$pass" --arg crt "$crt_path" --arg key "$key_path" \
             '{type: "trojan", tag: $tag, listen: "::", listen_port: ($port|tonumber), users: [{password: $pass}], tls: {enabled: true, certificate_path: $crt, key_path: $key}}')
-        link="trojan://${pass}@${domain}:${port}?security=tls&sni=${domain}&type=tcp#${tag}"
+        link="trojan://${pass}@${domain}:${port}?security=tls&sni=${domain}&type=tcp#$(echo -n "$tag" | jq -sRr @uri)"
     fi
 
     atomic_inject "$tag" "$json" "$link"
@@ -531,8 +557,10 @@ deploy_shadowsocks() {
         if check_port_free "$port"; then break; fi
     done
 
+    ask_for_tag "SS-$port"
+    local tag="$RET_TAG"
+
     fetch_public_ip
-    local tag="SS-$port"
 
     local json; json=$(jq -n \
         --arg tag "$tag" --arg port "$port" --arg method "$method" --arg pass "$pass" \
@@ -542,10 +570,10 @@ deploy_shadowsocks() {
     if [[ "$method" == 2022-* ]]; then
         local m_enc; m_enc=$(jq -nr --arg v "$method" '$v | @uri')
         local p_enc; p_enc=$(jq -nr --arg v "$pass" '$v | @uri')
-        link="ss://${m_enc}:${p_enc}@${PUBLIC_IP}:${port}#${tag}"
+        link="ss://${m_enc}:${p_enc}@${PUBLIC_IP}:${port}#$(echo -n "$tag" | jq -sRr @uri)"
     else
         local b64; b64=$(echo -n "${method}:${pass}" | base64 -w 0)
-        link="ss://${b64}@${PUBLIC_IP}:${port}#${tag}"
+        link="ss://${b64}@${PUBLIC_IP}:${port}#$(echo -n "$tag" | jq -sRr @uri)"
     fi
 
     atomic_inject "$tag" "$json" "$link"
@@ -567,8 +595,12 @@ deploy_vmess() {
         if check_port_free "$port"; then break; fi
     done
 
+    local default_name="VMess-$port"
+    [[ "$v_choice" == "2" ]] && default_name="VMess-WS-$port"
+    ask_for_tag "$default_name"
+    local tag="$RET_TAG"
+
     local uuid; uuid=$(uuidgen)
-    local tag="VMess-$port"
     local json=""
     local link=""
 
@@ -584,7 +616,6 @@ deploy_vmess() {
         local path="/$(openssl rand -hex 6)"
         info "已自动分配高匿随机路径: $path"
         
-        tag="VMess-WS-$port"
         local crt_path="$CERT_DIR/${domain}.crt"
         local key_path="$CERT_DIR/${domain}.key"
 
@@ -631,7 +662,9 @@ deploy_mixed() {
         if check_port_free "$port"; then break; fi
     done
 
-    local tag="Mixed-$port"
+    ask_for_tag "Mixed-$port"
+    local tag="$RET_TAG"
+
     local json=""
     local link=""
 
@@ -649,12 +682,12 @@ deploy_mixed() {
         json=$(jq -n \
             --arg tag "$tag" --arg port "$port" --arg user "$m_user" --arg pass "$m_pass" \
             '{type: "mixed", tag: $tag, listen: "::", listen_port: ($port|tonumber), users: [{username: $user, password: $pass}]}')
-        link="HTTP/SOCKS5: ${PUBLIC_IP}:${port} (账户: $m_user | 密码: $m_pass)"
+        link="HTTP/SOCKS5: ${PUBLIC_IP}:${port} (账户: $m_user | 密码: $m_pass) [#$tag]"
     else
         json=$(jq -n \
             --arg tag "$tag" --arg port "$port" \
             '{type: "mixed", tag: $tag, listen: "127.0.0.1", listen_port: ($port|tonumber)}')
-        link="内网 HTTP/SOCKS5: 127.0.0.1:${port}"
+        link="内网 HTTP/SOCKS5: 127.0.0.1:${port} [#$tag]"
     fi
 
     atomic_inject "$tag" "$json" "$link"
@@ -673,11 +706,13 @@ deploy_naive() {
         if [[ -n "$domain" ]]; then break; else err "域名不能为空。"; fi
     done
 
+    ask_for_tag "Naive-$port"
+    local tag="$RET_TAG"
+
     apply_cert "$domain" || return
 
     local user; user=$(openssl rand -hex 4)
     local pass; pass=$(openssl rand -hex 8)
-    local tag="Naive-$port"
     local crt_path="$CERT_DIR/${domain}.crt"
     local key_path="$CERT_DIR/${domain}.key"
 
@@ -685,7 +720,7 @@ deploy_naive() {
         --arg tag "$tag" --arg port "$port" --arg user "$user" --arg pass "$pass" --arg crt "$crt_path" --arg key "$key_path" \
         '{type: "naive", tag: $tag, listen: "::", listen_port: ($port|tonumber), users: [{username: $user, password: $pass}], tls: {enabled: true, certificate_path: $crt, key_path: $key}}')
     
-    local link="naive+https://${user}:${pass}@${domain}:${port}"
+    local link="naive+https://${user}:${pass}@${domain}:${port}#$(echo -n "$tag" | jq -sRr @uri)"
     atomic_inject "$tag" "$json" "$link"
 }
 
@@ -705,6 +740,9 @@ deploy_shadowtls() {
         if [[ -n "$sni" ]]; then break; else err "寄生目标不能为空。"; fi
     done
 
+    ask_for_tag "ShadowTLS-$port"
+    local tag="$RET_TAG"
+
     fetch_public_ip
     local internal_port
     while true; do
@@ -716,7 +754,6 @@ deploy_shadowtls() {
     local ss_pass; ss_pass=$(openssl rand -base64 16)
     local ss_method="2022-blake3-aes-128-gcm"
     
-    local tag="ShadowTLS-$port"
     local inner_tag="SS-Internal-$internal_port"
 
     local json; json=$(jq -n \
@@ -729,7 +766,7 @@ deploy_shadowtls() {
     
     local m_enc; m_enc=$(jq -nr --arg v "$ss_method" '$v | @uri')
     local p_enc; p_enc=$(jq -nr --arg v "$ss_pass" '$v | @uri')
-    local link="ss://${m_enc}:${p_enc}@${PUBLIC_IP}:${port}?plugin=shadowtls&shadowtls-password=${stls_pass}&shadowtls-sni=${sni}#${tag}"
+    local link="ss://${m_enc}:${p_enc}@${PUBLIC_IP}:${port}?plugin=shadowtls&shadowtls-password=${stls_pass}&shadowtls-sni=${sni}#$(echo -n "$tag" | jq -sRr @uri)"
     
     atomic_inject "$tag" "$json" "$link"
 }
@@ -761,19 +798,47 @@ list_nodes() {
 }
 
 delete_node() {
-    jq -r '.inbounds[] | select(.tag | startswith("SS-Internal-") | not) | " [\(.type)] 标签: \(.tag)"' "$CONF_FILE" 2>/dev/null || true
-    local t
-    while true; do
-        read -r -p "请输入要删除的节点标签 (输入 0 退出): " t </dev/tty
-        if [[ "$t" == "0" ]]; then return; fi
-        if [[ -n "$t" ]]; then break; else err "标签不能为空。"; fi
-    done
-
-    if [[ "$t" == SS-Internal-* ]]; then
-        err "越权操作：禁止直接物理剥离内部级联资产。"
+    if [[ ! -s "$LINK_DB" ]]; then
+        warn "当前无节点记录可删除。"
         return
     fi
-
+    
+    clear
+    echo "==================================================="
+    echo "                 请选择要删除的节点                "
+    echo "==================================================="
+    
+    local -a tags_array=()
+    local i=1
+    while IFS="|" read -r tag link; do
+        if [[ "$tag" == SS-Internal-* ]]; then continue; fi
+        if jq -e --arg t "$tag" '.inbounds[] | select(.tag == $t)' "$CONF_FILE" >/dev/null 2>&1; then
+            echo "  $i) $tag"
+            tags_array[$i]="$tag"
+            ((i++))
+        fi
+    done < "$LINK_DB"
+    
+    if [[ ${#tags_array[@]} -eq 0 ]]; then
+        warn "未检测到可开放的有效节点。"
+        return
+    fi
+    echo "  0) 返回主菜单"
+    echo "==================================================="
+    
+    local sel
+    while true; do
+        read -r -p "请输入要删除的节点序号 [0-$((i-1))]: " sel </dev/tty
+        if [[ "$sel" == "0" ]]; then return; fi
+        if [[ "$sel" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel < i )); then
+            break
+        else
+            err "输入的序号无效，请重新输入。"
+        fi
+    done
+    
+    local t="${tags_array[$sel]}"
+    
     if jq -e --arg tag "$t" '.inbounds[] | select(.tag == $tag)' "$CONF_FILE" >/dev/null 2>&1; then
         local tmp_conf="${CONF_FILE}.tmp"
         cp -a "$CONF_FILE" "${CONF_FILE}.bak"
@@ -798,14 +863,14 @@ delete_node() {
             else
                 sed -i "/^$t|/d" "$LINK_DB" 2>/dev/null || true
                 rm -f "${CONF_FILE}.bak"
-                info "节点 [$t] (及附属拓扑) 已彻底移除。"
+                info "节点 [\033[33m$t\033[0m] 已被彻底移除。"
             fi
         else
             err "配置逻辑校验失败，回绝摘除指令。"
             rm -f "$tmp_conf" "${CONF_FILE}.bak"
         fi
     else
-        warn "未找到对应标签。"
+        warn "节点配置异常丢失，请检查 config.json。"
     fi
 }
 
