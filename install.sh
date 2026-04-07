@@ -773,33 +773,70 @@ deploy_shadowtls() {
 
 # ================= 状态控制与生命周期管理 =================
 list_nodes() {
-    clear
-    echo "==================================================="
-    echo "                 查看所有节点                      "
-    echo "==================================================="
     if [[ ! -s "$LINK_DB" ]]; then
-        echo " 当前无节点记录。"
-    else
+        warn "当前无节点记录可查看。"
+        sleep 1.5
+        return
+    fi
+
+    while true; do
+        clear
+        echo "==================================================="
+        echo "                 请选择要查看的节点                "
+        echo "==================================================="
+
+        local -a tags_array=()
+        local -a links_array=()
+        local i=1
+
         while IFS="|" read -r tag link; do
-            if [[ "$tag" == SS-Internal-* ]]; then
-                continue
-            fi
-            
+            if [[ "$tag" == SS-Internal-* ]]; then continue; fi
+
             if jq -e --arg t "$tag" '.inbounds[] | select(.tag == $t)' "$CONF_FILE" >/dev/null 2>&1; then
-                echo -e " 标签: \033[33m$tag\033[0m"
-                echo -e " 链接: \033[36m$link\033[0m"
-                if [[ "$link" =~ ^(vless|hysteria2|tuic|trojan|ss|vmess|naive):// ]]; then
-                    qrencode -t UTF8 "$link" 2>/dev/null || true
-                fi
-                echo "---------------------------------------------------"
+                echo "  $i) $tag"
+                tags_array[$i]="$tag"
+                links_array[$i]="$link"
+                ((i++))
             fi
         done < "$LINK_DB"
-    fi
+
+        if [[ ${#tags_array[@]} -eq 0 ]]; then
+            warn "未检测到可开放的有效节点。"
+            sleep 1.5
+            return
+        fi
+        
+        echo "  0) 返回主菜单"
+        echo "==================================================="
+
+        local sel
+        read -r -p "请输入要查看的节点序号 [0-$((i-1))]: " sel </dev/tty
+        
+        if [[ "$sel" == "0" ]]; then
+            return
+        elif [[ "$sel" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel < i )); then
+            clear
+            echo "==================================================="
+            echo -e " 标签: \033[33m${tags_array[$sel]}\033[0m"
+            echo -e " 链接: \033[36m${links_array[$sel]}\033[0m"
+            echo "---------------------------------------------------"
+            local view_link="${links_array[$sel]}"
+            if [[ "$view_link" =~ ^(vless|hysteria2|tuic|trojan|ss|vmess|naive):// ]]; then
+                qrencode -t UTF8 "$view_link" 2>/dev/null || true
+            fi
+            echo "==================================================="
+            read -r -p "➤ 按回车键返回节点列表..." </dev/tty
+        else
+            err "输入的序号无效，请重新输入。"
+            sleep 1
+        fi
+    done
 }
 
 delete_node() {
     if [[ ! -s "$LINK_DB" ]]; then
         warn "当前无节点记录可删除。"
+        sleep 1.5
         return
     fi
     
@@ -821,8 +858,10 @@ delete_node() {
     
     if [[ ${#tags_array[@]} -eq 0 ]]; then
         warn "未检测到可开放的有效节点。"
+        sleep 1.5
         return
     fi
+    
     echo "  0) 返回主菜单"
     echo "==================================================="
     
@@ -864,13 +903,16 @@ delete_node() {
                 sed -i "/^$t|/d" "$LINK_DB" 2>/dev/null || true
                 rm -f "${CONF_FILE}.bak"
                 info "节点 [\033[33m$t\033[0m] 已被彻底移除。"
+                read -r -p "➤ 按回车键继续..." </dev/tty
             fi
         else
             err "配置逻辑校验失败，回绝摘除指令。"
             rm -f "$tmp_conf" "${CONF_FILE}.bak"
+            sleep 1.5
         fi
     else
         warn "节点配置异常丢失，请检查 config.json。"
+        sleep 1.5
     fi
 }
 
@@ -927,7 +969,7 @@ main_menu() {
     echo "==================================================="
     echo -e " 核心配置: \033[36m$CONF_FILE\033[0m"
     echo "---------------------------------------------------"
-    echo "  1) 安装/更新 Sing-box"
+    echo "  1) 安装/更新 Sing-box 内核与依赖"
     echo "  2) 一键部署 VLESS-Reality"
     echo "  3) 一键部署 VLESS-WS"
     echo "  4) 一键部署 AnyTLS"
@@ -998,11 +1040,9 @@ main_menu() {
             ;;
         13) 
             if check_singbox_installed; then list_nodes; fi
-            read -r -p "➤ 按回车键返回..." </dev/tty 
             ;;
         14) 
             if check_singbox_installed; then delete_node; fi
-            read -r -p "➤ 按回车键返回..." </dev/tty 
             ;;
         15) 
             uninstall_core 
