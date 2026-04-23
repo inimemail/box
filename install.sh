@@ -411,7 +411,7 @@ deploy_anytls() {
     atomic_inject "$tag" "$json" "[非标准协议] 需客户端手动配置 AnyTLS 出站。鉴权密码: $pass"
 }
 
-deploy_hysteria2() {
+deploy_hy2() {
     local port
     while true; do
         read -r -p "请输入 UDP 监听端口: " port </dev/tty
@@ -424,7 +424,7 @@ deploy_hysteria2() {
         if [[ -n "$domain" ]]; then break; else err "域名不能为空，请重新输入。"; fi
     done
 
-    ask_for_tag "Hysteria2-$port"
+    ask_for_tag "hy2-$port"
     local tag="$RET_TAG"
 
     apply_cert "$domain" || return
@@ -524,7 +524,7 @@ deploy_trojan() {
     atomic_inject "$tag" "$json" "$link"
 }
 
-deploy_shadowsocks() {
+deploy_ss() {
     echo -e "请选择加密方式:"
     echo "  1) 2022-blake3-aes-128-gcm (2022推荐)"
     echo "  2) 2022-blake3-aes-256-gcm"
@@ -557,7 +557,7 @@ deploy_shadowsocks() {
         if check_port_free "$port"; then break; fi
     done
 
-    ask_for_tag "SS-$port"
+    ask_for_tag "ss-$port"
     local tag="$RET_TAG"
 
     fetch_public_ip
@@ -682,7 +682,7 @@ deploy_mixed() {
         json=$(jq -n \
             --arg tag "$tag" --arg port "$port" --arg user "$m_user" --arg pass "$m_pass" \
             '{type: "mixed", tag: $tag, listen: "::", listen_port: ($port|tonumber), users: [{username: $user, password: $pass}]}')
-        link="HTTP/SOCKS5: ${PUBLIC_IP}:${port} (账户: $m_user | 密码: $m_pass) [#$tag]"
+        link="HTTP/SOCKS5: ${PUBLIC_IP}:${port} (账户: $m_user |密码: $m_pass) [#$tag]"
     else
         json=$(jq -n \
             --arg tag "$tag" --arg port "$port" \
@@ -718,7 +718,19 @@ deploy_naive() {
 
     local json; json=$(jq -n \
         --arg tag "$tag" --arg port "$port" --arg user "$user" --arg pass "$pass" --arg crt "$crt_path" --arg key "$key_path" \
-        '{type: "naive", tag: $tag, listen: "::", listen_port: ($port|tonumber), users: [{username: $user, password: $pass}], tls: {enabled: true, certificate_path: $crt, key_path: $key}}')
+        '{
+          type: "naive", 
+          tag: $tag, 
+          listen: "::", 
+          listen_port: ($port|tonumber), 
+          users: [{username: $user, password: $pass}], 
+          tls: {
+            enabled: true, 
+            alpn: ["h2", "http/1.1"], 
+            certificate_path: $crt, 
+            key_path: $key
+          }
+        }')
     
     local link="naive+https://${user}:${pass}@${domain}:${port}#$(echo -n "$tag" | jq -sRr @uri)"
     atomic_inject "$tag" "$json" "$link"
@@ -726,7 +738,7 @@ deploy_naive() {
 
 deploy_shadowtls() {
     check_singbox_version "1.8.0" || return
-    info "ShadowTLS 为链式协议，将自动在后台构建隐藏的 SS 2022 解密端。"
+    info "ShadowTLS 为链式协议，将自动在后台构建隐藏的 ss 2022 解密端。"
     
     local port
     while true; do
@@ -973,10 +985,10 @@ main_menu() {
     echo "  2) 一键部署 VLESS-Reality"
     echo "  3) 一键部署 VLESS-WS"
     echo "  4) 一键部署 AnyTLS"
-    echo "  5) 一键部署 Hysteria2"
+    echo "  5) 一键部署 hy2"
     echo "  6) 一键部署 TUIC v5"
     echo "  7) 一键部署 Trojan"
-    echo "  8) 一键部署 Shadowsocks"
+    echo "  8) 一键部署 ss"
     echo "  9) 一键部署 VMess"
     echo " 10) 一键部署 Mixed (HTTP/SOCKS)"
     echo " 11) 一键部署 NaiveProxy"
@@ -1007,7 +1019,7 @@ main_menu() {
             read -r -p "➤ 按回车键返回..." </dev/tty 
             ;;
         5) 
-            if check_singbox_installed; then deploy_hysteria2; fi
+            if check_singbox_installed; then deploy_hy2; fi
             read -r -p "➤ 按回车键返回..." </dev/tty 
             ;;
         6) 
@@ -1019,7 +1031,7 @@ main_menu() {
             read -r -p "➤ 按回车键返回..." </dev/tty 
             ;;
         8) 
-            if check_singbox_installed; then deploy_shadowsocks; fi
+            if check_singbox_installed; then deploy_ss; fi
             read -r -p "➤ 按回车键返回..." </dev/tty 
             ;;
         9) 
