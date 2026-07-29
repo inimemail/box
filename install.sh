@@ -430,14 +430,71 @@ deploy_hy2() {
     apply_cert "$domain" || return
 
     local pass; pass=$(openssl rand -hex 12)
+    local obfs_type=""
+    local obfs_pass=""
+    local obfs_choice
+    echo "请选择 HY2 混淆模式:"
+    echo "  1) 不启用混淆"
+    echo "  2) Salamander（推荐）"
+    while true; do
+        read -r -p "请选择 [1-2，回车默认 2]: " obfs_choice </dev/tty
+        case "${obfs_choice:-2}" in
+            1)
+                break
+                ;;
+            2)
+                obfs_type="salamander"
+                while true; do
+                    IFS= read -r -p "请输入 Salamander 密码 [回车自动生成]: " obfs_pass </dev/tty
+                    if [[ -z "$obfs_pass" ]]; then
+                        obfs_pass=$(openssl rand -hex 16)
+                        info "已自动生成 Salamander 密码。"
+                        break
+                    fi
+                    if (( ${#obfs_pass} < 8 || ${#obfs_pass} > 128 )); then
+                        err "Salamander 密码长度必须为 8 到 128 个字符。"
+                        continue
+                    fi
+                    if [[ ! "$obfs_pass" =~ ^[^[:space:]]+$ ]]; then
+                        err "Salamander 密码不能包含空格、制表符或其他空白字符。"
+                        continue
+                    fi
+                    break
+                done
+                break
+                ;;
+            *)
+                err "输入错误，请选择 1 或 2。"
+                ;;
+        esac
+    done
+
     local crt_path="$CERT_DIR/${domain}.crt"
     local key_path="$CERT_DIR/${domain}.key"
 
-    local json; json=$(jq -n \
-        --arg tag "$tag" --arg port "$port" --arg pass "$pass" --arg crt "$crt_path" --arg key "$key_path" \
-        '{type: "hysteria2", tag: $tag, listen: "::", listen_port: ($port|tonumber), users: [{password: $pass}], tls: {enabled: true, alpn: ["h3"], certificate_path: $crt, key_path: $key}}')
-    
-    local link="hysteria2://${pass}@${domain}:${port}/?sni=${domain}#$(echo -n "$tag" | jq -sRr @uri)"
+    local json
+    if [[ "$obfs_type" == "salamander" ]]; then
+        json=$(jq -n \
+            --arg tag "$tag" --arg port "$port" --arg pass "$pass" \
+            --arg obfs_pass "$obfs_pass" --arg crt "$crt_path" --arg key "$key_path" \
+            '{type: "hysteria2", tag: $tag, listen: "::", listen_port: ($port|tonumber), users: [{password: $pass}], obfs: {type: "salamander", password: $obfs_pass}, tls: {enabled: true, alpn: ["h3"], certificate_path: $crt, key_path: $key}}')
+    else
+        json=$(jq -n \
+            --arg tag "$tag" --arg port "$port" --arg pass "$pass" --arg crt "$crt_path" --arg key "$key_path" \
+            '{type: "hysteria2", tag: $tag, listen: "::", listen_port: ($port|tonumber), users: [{password: $pass}], tls: {enabled: true, alpn: ["h3"], certificate_path: $crt, key_path: $key}}')
+    fi
+
+    local pass_uri sni_uri tag_uri obfs_pass_uri
+    pass_uri=$(jq -nr --arg v "$pass" '$v | @uri')
+    sni_uri=$(jq -nr --arg v "$domain" '$v | @uri')
+    tag_uri=$(jq -nr --arg v "$tag" '$v | @uri')
+
+    local link="hysteria2://${pass_uri}@${domain}:${port}/?sni=${sni_uri}"
+    if [[ "$obfs_type" == "salamander" ]]; then
+        obfs_pass_uri=$(jq -nr --arg v "$obfs_pass" '$v | @uri')
+        link+="&obfs=salamander&obfs-password=${obfs_pass_uri}"
+    fi
+    link+="#${tag_uri}"
     atomic_inject "$tag" "$json" "$link"
 }
 
