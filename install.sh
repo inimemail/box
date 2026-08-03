@@ -8,7 +8,11 @@ CONF_DIR="/etc/sing-box"
 CONF_FILE="$CONF_DIR/config.json"
 CERT_DIR="$CONF_DIR/certs"
 LINK_DB="$CONF_DIR/links.db"
-ACME_DIR="$HOME/.acme.sh"
+PAUSED_DB="$CONF_DIR/paused-nodes.json"
+ACME_DIR="${HOME:-/root}/.acme.sh"
+EXPIRY_HELPER="/usr/local/sbin/sing-box-node-manager"
+EXPIRY_SERVICE="/etc/systemd/system/sing-box-node-expiry.service"
+EXPIRY_TIMER="/etc/systemd/system/sing-box-node-expiry.timer"
 
 info() { echo -e "\033[32m[INFO]\033[0m $1"; }
 warn() { echo -e "\033[33m[WARN]\033[0m $1" >&2; }
@@ -25,6 +29,8 @@ require_cmd() {
         if [[ "$cmd" == "uuidgen" ]]; then
             if command -v apt-get >/dev/null 2>&1; then pkg_name="uuid-runtime"
             elif command -v yum >/dev/null 2>&1; then pkg_name="util-linux"; fi
+        elif [[ "$cmd" == "flock" ]]; then
+            pkg_name="util-linux"
         elif [[ "$cmd" == "ss" ]]; then
             if command -v apt-get >/dev/null 2>&1; then pkg_name="iproute2"
             elif command -v yum >/dev/null 2>&1; then pkg_name="iproute"; fi
@@ -63,6 +69,13 @@ init_env() {
     mkdir -p "$CONF_DIR" "$CERT_DIR"
     touch "$LINK_DB"
     chmod 600 "$LINK_DB" 2>/dev/null || true
+
+    if [[ ! -s "$PAUSED_DB" ]]; then
+        printf '{}\n' > "$PAUSED_DB"
+    elif command -v jq >/dev/null 2>&1 && ! jq -e 'type == "object"' "$PAUSED_DB" >/dev/null 2>&1; then
+        die "暂停节点数据库格式损坏: $PAUSED_DB"
+    fi
+    chmod 600 "$PAUSED_DB" 2>/dev/null || true
 
     if [[ ! -f "$CONF_FILE" ]]; then
         cat > "$CONF_FILE" <<EOF
@@ -125,12 +138,174 @@ ask_for_tag() {
             continue
         fi
         
-        if jq -e --arg t "$RET_TAG" '.inbounds[] | select(.tag == $t)' "$CONF_FILE" >/dev/null 2>&1; then
+        if jq -e --arg t "$RET_TAG" '.inbounds[] | select(.tag == $t)' "$CONF_FILE" >/dev/null 2>&1 || \
+           jq -e --arg t "$RET_TAG" 'has($t)' "$PAUSED_DB" >/dev/null 2>&1; then
             err "当前配置中已存在同名节点 [$RET_TAG]，请换一个名称。"
         else
             break
         fi
     done
+}
+
+# links.db 新格式: 标签|过期时间戳(0 表示永久)|分享链接。
+# 旧格式为 标签|分享链接，读取时自动按永久节点兼容。
+parse_link_record() {
+    local line=$1
+    local first_field rest
+
+    RECORD_TAG=${line%%|*}
+    if [[ "$line" != *"|"* ]]; then
+        RECORD_EXPIRES_AT=0
+        RECORD_LINK=""
+        return
+    fi
+
+    rest=${line#*|}
+    first_field=${rest%%|*}
+    if [[ "$rest" == *"|"* && "$first_field" =~ ^[0-9]+$ ]]; then
+        RECORD_EXPIRES_AT=$first_field
+        RECORD_LINK=${rest#*|}
+    else
+        RECORD_EXPIRES_AT=0
+        RECORD_LINK=$rest
+    fi
+}
+
+format_expiry() {
+    local expires_at=${1:-0}
+    if [[ "$expires_at" == "0" ]]; then
+        printf '永久'
+    else
+        date -d "@$expires_at" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || printf '时间戳 %s' "$expires_at"
+    fi
+}
+
+ask_for_expiry() {
+    local choice input parsed days target_month last_day current_day target_day
+    local target_date expiry_time custom_expiry reference_epoch reference_date reference_time
+    while true; do
+        target_date=""
+        days=""
+        custom_expiry=false
+        echo "请选择节点有效期:"
+        echo "  1) 永久"
+        echo "  2) 1 天"
+        echo "  3) 7 天"
+        echo "  4) 15 天"
+        echo "  5) 1 个自然月（下个月同日）"
+        echo "  6) 自定义有效天数（可设置时分秒）"
+        echo "  7) 指定到期日期（可设置时分秒）"
+        read -r -p "请选择 [1-7，回车默认永久]: " choice </dev/tty
+        reference_epoch=$(date +%s)
+        reference_date=$(date -d "@$reference_epoch" +%Y-%m-%d)
+        reference_time=$(date -d "@$reference_epoch" +%H:%M:%S)
+
+        case "${choice:-1}" in
+            1)
+                RET_EXPIRES_AT=0
+                return
+                ;;
+            2) days=1 ;;
+            3) days=7 ;;
+            4) days=15 ;;
+            5)
+                target_month=$(date -d "${reference_date%-??}-01 +1 month" +%Y-%m)
+                last_day=$(date -d "${target_month}-01 +1 month -1 day" +%d)
+                current_day=$(date -d "@$reference_epoch" +%d)
+                current_day=$((10#$current_day))
+                last_day=$((10#$last_day))
+                if (( current_day > last_day )); then
+                    target_day=$last_day
+                else
+                    target_day=$current_day
+                fi
+                target_date=$(printf '%s-%02d' "$target_month" "$target_day")
+                ;;
+            6)
+                read -r -p "请输入有效天数 [1-36500]: " input </dev/tty
+                if ! [[ "$input" =~ ^[1-9][0-9]*$ ]] || (( input > 36500 )); then
+                    err "有效天数必须为 1 到 36500 的整数。"
+                    continue
+                fi
+                days=$input
+                custom_expiry=true
+                ;;
+            7)
+                read -r -p "请输入到期日期 (YYYY-MM-DD): " input </dev/tty
+                parsed=$(date -d "$input" +%Y-%m-%d 2>/dev/null || true)
+                if [[ ! "$input" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ || "$parsed" != "$input" ]]; then
+                    err "到期日期格式错误。"
+                    continue
+                fi
+                target_date=$input
+                custom_expiry=true
+                ;;
+            *)
+                err "输入错误，请选择 1 到 7。"
+                continue
+                ;;
+        esac
+
+        if [[ -z "${target_date:-}" ]]; then
+            target_date=$(date -d "$reference_date +$days day" +%Y-%m-%d)
+        fi
+
+        if ! $custom_expiry; then
+            expiry_time=$reference_time
+            RET_EXPIRES_AT=$(date -d "$target_date $expiry_time" +%s)
+            return
+        fi
+
+        while true; do
+            read -r -p "请输入到期时分秒 (HH:MM:SS) [回车默认 00:00:00]: " expiry_time </dev/tty
+            expiry_time=${expiry_time:-00:00:00}
+            if [[ "$expiry_time" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]$ ]]; then
+                parsed=$(date -d "$target_date $expiry_time" +%s 2>/dev/null || true)
+                if [[ "$parsed" =~ ^[0-9]+$ ]] && (( parsed > $(date +%s) )); then
+                    RET_EXPIRES_AT=$parsed
+                    return
+                fi
+                err "指定的到期时间已经过去。"
+                break
+            fi
+            err "时分秒格式错误，请按 HH:MM:SS 输入。"
+        done
+    done
+}
+
+rewrite_link_expiry() {
+    local target_tag=$1
+    local expires_at=$2
+    local tmp_db="${LINK_DB}.tmp"
+    local line
+
+    : > "$tmp_db"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        parse_link_record "$line"
+        if [[ "$RECORD_TAG" == "$target_tag" ]]; then
+            printf '%s|%s|%s\n' "$RECORD_TAG" "$expires_at" "$RECORD_LINK" >> "$tmp_db"
+        else
+            printf '%s\n' "$line" >> "$tmp_db"
+        fi
+    done < "$LINK_DB"
+    chmod 600 "$tmp_db" 2>/dev/null || true
+    mv "$tmp_db" "$LINK_DB"
+}
+
+remove_link_record() {
+    local target_tag=$1
+    local tmp_db="${LINK_DB}.tmp"
+    local line
+
+    : > "$tmp_db"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        parse_link_record "$line"
+        if [[ "$RECORD_TAG" != "$target_tag" ]]; then
+            printf '%s\n' "$line" >> "$tmp_db"
+        fi
+    done < "$LINK_DB"
+    chmod 600 "$tmp_db" 2>/dev/null || true
+    mv "$tmp_db" "$LINK_DB"
 }
 
 # ================= 安装与环境装配核心 =================
@@ -143,6 +318,7 @@ install_singbox() {
     require_cmd qrencode
     require_cmd socat
     require_cmd ss
+    require_cmd flock
 
     info "开始拉取 Sing-box 内核..."
     local arch
@@ -197,6 +373,7 @@ EOF
     systemctl daemon-reload
     systemctl enable sing-box
     systemctl restart sing-box
+    setup_expiry_timer
     
     info "Sing-box v$latest_version 及依赖环境已成功安装并启动！"
 }
@@ -268,10 +445,17 @@ apply_cert() {
 }
 
 # ================= 原子化注入与回滚核心 =================
-atomic_inject() {
+atomic_inject() (
+    exec 9> "$CONF_DIR/node-state.lock"
+    flock 9
+
     local tag=$1
     local safe_json=$2
     local link=$3
+    local expires_at
+
+    ask_for_expiry
+    expires_at=$RET_EXPIRES_AT
 
     local tmp_conf="${CONF_FILE}.tmp"
     cp -a "$CONF_FILE" "$tmp_conf"
@@ -302,18 +486,19 @@ atomic_inject() {
         return 1
     fi
 
-    echo "$tag|$link" >> "$LINK_DB"
+    printf '%s|%s|%s\n' "$tag" "$expires_at" "$link" >> "$LINK_DB"
     rm -f "${CONF_FILE}.bak"
     
     echo -e "\n=================================================="
     info "部署完成！"
     echo -e "节点标签: \033[33m$tag\033[0m"
+    echo -e "有效期至: \033[33m$(format_expiry "$expires_at")\033[0m"
     echo -e "分享链接: \033[36m$link\033[0m"
     if [[ "$link" =~ ^(vless|hysteria2|tuic|trojan|ss|vmess|naive):// ]]; then
         qrencode -t UTF8 "$link" 2>/dev/null || true
     fi
     echo -e "==================================================\n"
-}
+)
 
 # ================= 高维协议装载器 =================
 deploy_vless_reality() {
@@ -813,18 +998,23 @@ deploy_shadowtls() {
     local tag="$RET_TAG"
 
     fetch_public_ip
-    local internal_port
+    local internal_port inner_tag
     while true; do
         internal_port=$((RANDOM % 10000 + 40000))
-        if check_port_free "$internal_port"; then break; fi
+        inner_tag="SS-Internal-$internal_port"
+        if check_port_free "$internal_port"; then
+            if jq -e --arg tag "$inner_tag" \
+                '[.[] | .inbounds[]? | select(.tag == $tag)] | length > 0' "$PAUSED_DB" >/dev/null 2>&1; then
+                continue
+            fi
+            break
+        fi
     done
     
     local stls_pass; stls_pass=$(openssl rand -hex 8)
     local ss_pass; ss_pass=$(openssl rand -base64 16)
     local ss_method="2022-blake3-aes-128-gcm"
     
-    local inner_tag="SS-Internal-$internal_port"
-
     local json; json=$(jq -n \
         --arg tag "$tag" --arg port "$port" --arg stls_pass "$stls_pass" --arg sni "$sni" --arg inner "$inner_tag" \
         --arg ss_port "$internal_port" --arg ss_method "$ss_method" --arg ss_pass "$ss_pass" \
@@ -838,6 +1028,209 @@ deploy_shadowtls() {
     local link="ss://${m_enc}:${p_enc}@${PUBLIC_IP}:${port}?plugin=shadowtls&shadowtls-password=${stls_pass}&shadowtls-sni=${sni}#$(echo -n "$tag" | jq -sRr @uri)"
     
     atomic_inject "$tag" "$json" "$link"
+}
+
+# ================= 节点过期暂停与恢复 =================
+setup_expiry_timer() {
+    if ! command -v systemctl >/dev/null 2>&1 || ! command -v sing-box >/dev/null 2>&1; then
+        return
+    fi
+
+    local script_path
+    script_path=$(readlink -f "$0" 2>/dev/null || true)
+    if [[ -z "$script_path" || ! -f "$script_path" ]]; then
+        warn "无法定位当前脚本，节点过期定时器未安装。"
+        return
+    fi
+
+    if [[ "$script_path" != "$EXPIRY_HELPER" ]]; then
+        install -m 700 "$script_path" "$EXPIRY_HELPER"
+    fi
+
+    cat > "$EXPIRY_SERVICE" <<EOF
+[Unit]
+Description=Pause expired sing-box nodes
+After=sing-box.service
+
+[Service]
+Type=oneshot
+Environment=HOME=/root
+ExecStart=/bin/bash $EXPIRY_HELPER --pause-expired
+EOF
+
+    cat > "$EXPIRY_TIMER" <<EOF
+[Unit]
+Description=Check sing-box node expiration
+
+[Timer]
+OnBootSec=10s
+OnUnitActiveSec=10s
+AccuracySec=1s
+Unit=sing-box-node-expiry.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if ! systemctl enable --now sing-box-node-expiry.timer >/dev/null 2>&1 || \
+       ! systemctl restart sing-box-node-expiry.timer >/dev/null 2>&1; then
+        warn "节点过期定时器启用失败。"
+    fi
+}
+
+pause_nodes_unlocked() {
+    local reason=$1
+    shift
+    (( $# > 0 )) || return 0
+
+    local node_json inner_tag tag
+    local tmp_conf="${CONF_FILE}.pause.tmp"
+    local tmp_paused="${PAUSED_DB}.tmp"
+    local backup_conf="${CONF_FILE}.pause.bak"
+    local backup_paused="${PAUSED_DB}.bak"
+    local -a paused_tags=()
+
+    cp -a "$CONF_FILE" "$tmp_conf"
+    cp -a "$PAUSED_DB" "$tmp_paused"
+
+    for tag in "$@"; do
+        if ! jq -e --arg tag "$tag" '.inbounds[] | select(.tag == $tag)' "$tmp_conf" >/dev/null 2>&1; then
+            continue
+        fi
+
+        inner_tag=$(jq -r --arg tag "$tag" '.inbounds[] | select(.tag == $tag) | .detour // empty' "$tmp_conf" 2>/dev/null || true)
+        node_json=$(jq -c --arg tag "$tag" --arg inner "$inner_tag" \
+            '[.inbounds[] | select(.tag == $tag or ($inner != "" and .tag == $inner))]' "$tmp_conf")
+
+        jq --arg tag "$tag" --arg reason "$reason" --argjson nodes "$node_json" \
+            '.[$tag] = {inbounds: $nodes, paused_at: (now | floor), reason: $reason}' "$tmp_paused" > "${tmp_paused}.2"
+        mv "${tmp_paused}.2" "$tmp_paused"
+
+        jq --arg tag "$tag" --arg inner "$inner_tag" \
+            '.inbounds |= map(select(.tag != $tag and ($inner == "" or .tag != $inner)))' "$tmp_conf" > "${tmp_conf}.2"
+        mv "${tmp_conf}.2" "$tmp_conf"
+        paused_tags+=("$tag")
+    done
+
+    if (( ${#paused_tags[@]} == 0 )); then
+        rm -f "$tmp_conf" "$tmp_paused"
+        return 0
+    fi
+
+    if ! sing-box check -c "$tmp_conf" >/dev/null 2>&1; then
+        err "暂停节点后的配置校验失败，本次操作已取消。"
+        rm -f "$tmp_conf" "$tmp_paused"
+        return 1
+    fi
+
+    cp -a "$CONF_FILE" "$backup_conf"
+    cp -a "$PAUSED_DB" "$backup_paused"
+    mv "$tmp_conf" "$CONF_FILE"
+    mv "$tmp_paused" "$PAUSED_DB"
+    chmod 600 "$CONF_FILE" "$PAUSED_DB" 2>/dev/null || true
+    systemctl restart sing-box >/dev/null 2>&1 || true
+    sleep 1
+
+    if ! systemctl is-active --quiet sing-box; then
+        mv "$backup_conf" "$CONF_FILE"
+        mv "$backup_paused" "$PAUSED_DB"
+        systemctl restart sing-box >/dev/null 2>&1 || true
+        err "暂停节点后服务异常，已回滚。"
+        return 1
+    fi
+
+    rm -f "$backup_conf" "$backup_paused"
+    for tag in "${paused_tags[@]}"; do
+        if [[ "$reason" == "expired" ]]; then
+            info "节点 [$tag] 已到期并暂停。"
+        else
+            info "节点 [$tag] 已手动暂停。"
+        fi
+    done
+}
+
+pause_expired_nodes() (
+    exec 9> "$CONF_DIR/node-state.lock"
+    flock -n 9 || return 0
+
+    [[ -s "$LINK_DB" ]] || return 0
+
+    local now line
+    local -a expired_tags=()
+    now=$(date +%s)
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        parse_link_record "$line"
+        [[ -n "$RECORD_TAG" ]] || continue
+        if [[ "$RECORD_EXPIRES_AT" =~ ^[0-9]+$ ]] && \
+           (( RECORD_EXPIRES_AT > 0 && RECORD_EXPIRES_AT <= now )) && \
+           jq -e --arg t "$RECORD_TAG" '.inbounds[] | select(.tag == $t)' "$CONF_FILE" >/dev/null 2>&1; then
+            local existing_tag already_seen=false
+            for existing_tag in "${expired_tags[@]}"; do
+                if [[ "$existing_tag" == "$RECORD_TAG" ]]; then
+                    already_seen=true
+                    break
+                fi
+            done
+            if ! $already_seen; then
+                expired_tags+=("$RECORD_TAG")
+            fi
+        fi
+    done < "$LINK_DB"
+
+    (( ${#expired_tags[@]} > 0 )) || return 0
+    pause_nodes_unlocked expired "${expired_tags[@]}"
+)
+
+resume_node() {
+    local tag=$1
+    local nodes
+    local tmp_conf="${CONF_FILE}.resume.tmp"
+    local tmp_paused="${PAUSED_DB}.tmp"
+
+    if ! jq -e --arg tag "$tag" 'has($tag)' "$PAUSED_DB" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    nodes=$(jq -c --arg tag "$tag" '.[$tag].inbounds' "$PAUSED_DB")
+    if [[ "$nodes" == "null" ]] || \
+       ! jq -en --argjson nodes "$nodes" \
+        '($nodes | type) == "array" and ($nodes | length) > 0 and
+         all($nodes[]; type == "object" and (.tag | type) == "string" and (.tag | length > 0)) and
+         ([$nodes[].tag] | unique | length) == ($nodes | length)' >/dev/null 2>&1 || \
+       ! jq -e --argjson nodes "$nodes" \
+        '[.inbounds[].tag] as $existing | all($nodes[].tag; . as $tag | ($existing | index($tag) | not))' "$CONF_FILE" >/dev/null 2>&1; then
+        err "节点 [$tag] 的暂停配置缺失或标签已被占用，无法恢复。"
+        return 1
+    fi
+
+    jq --argjson nodes "$nodes" '.inbounds += $nodes' "$CONF_FILE" > "$tmp_conf"
+    if ! sing-box check -c "$tmp_conf" >/dev/null 2>&1; then
+        err "节点 [$tag] 恢复配置校验失败。"
+        rm -f "$tmp_conf"
+        return 1
+    fi
+
+    jq --arg tag "$tag" 'del(.[$tag])' "$PAUSED_DB" > "$tmp_paused"
+    cp -a "$CONF_FILE" "${CONF_FILE}.resume.bak"
+    cp -a "$PAUSED_DB" "${PAUSED_DB}.bak"
+    mv "$tmp_conf" "$CONF_FILE"
+    mv "$tmp_paused" "$PAUSED_DB"
+    chmod 600 "$CONF_FILE" "$PAUSED_DB" 2>/dev/null || true
+    systemctl restart sing-box >/dev/null 2>&1 || true
+    sleep 1
+
+    if ! systemctl is-active --quiet sing-box; then
+        mv "${CONF_FILE}.resume.bak" "$CONF_FILE"
+        mv "${PAUSED_DB}.bak" "$PAUSED_DB"
+        systemctl restart sing-box >/dev/null 2>&1 || true
+        err "节点 [$tag] 恢复后服务异常，已回滚。"
+        return 1
+    fi
+
+    rm -f "${CONF_FILE}.resume.bak" "${PAUSED_DB}.bak"
+    return 0
 }
 
 # ================= 状态控制与生命周期管理 =================
@@ -856,17 +1249,36 @@ list_nodes() {
 
         local -a tags_array=()
         local -a links_array=()
+        local -a expires_array=()
+        local -a states_array=()
         local i=1
+        local line state expiry_text pause_reason
 
-        while IFS="|" read -r tag link; do
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            parse_link_record "$line"
+            local tag="$RECORD_TAG"
+            local link="$RECORD_LINK"
             if [[ "$tag" == SS-Internal-* ]]; then continue; fi
 
             if jq -e --arg t "$tag" '.inbounds[] | select(.tag == $t)' "$CONF_FILE" >/dev/null 2>&1; then
-                echo "  $i) $tag"
-                tags_array[$i]="$tag"
-                links_array[$i]="$link"
-                ((i++))
+                state="运行中"
+            elif jq -e --arg t "$tag" 'has($t)' "$PAUSED_DB" >/dev/null 2>&1; then
+                pause_reason=$(jq -r --arg t "$tag" '.[$t].reason // "expired"' "$PAUSED_DB")
+                if [[ "$pause_reason" == "manual" ]]; then
+                    state="手动暂停"
+                else
+                    state="到期暂停"
+                fi
+            else
+                continue
             fi
+            expiry_text=$(format_expiry "$RECORD_EXPIRES_AT")
+            echo "  $i) $tag [$state | $expiry_text]"
+            tags_array[$i]="$tag"
+            links_array[$i]="$link"
+            expires_array[$i]="$RECORD_EXPIRES_AT"
+            states_array[$i]="$state"
+            ((i++))
         done < "$LINK_DB"
 
         if [[ ${#tags_array[@]} -eq 0 ]]; then
@@ -887,6 +1299,8 @@ list_nodes() {
             clear
             echo "==================================================="
             echo -e " 标签: \033[33m${tags_array[$sel]}\033[0m"
+            echo -e " 状态: \033[33m${states_array[$sel]}\033[0m"
+            echo -e " 到期: \033[33m$(format_expiry "${expires_array[$sel]}")\033[0m"
             echo -e " 链接: \033[36m${links_array[$sel]}\033[0m"
             echo "---------------------------------------------------"
             local view_link="${links_array[$sel]}"
@@ -902,7 +1316,190 @@ list_nodes() {
     done
 }
 
-delete_node() {
+set_node_expiry() (
+    exec 9> "$CONF_DIR/node-state.lock"
+    flock 9
+
+    if [[ ! -s "$LINK_DB" ]]; then
+        warn "当前无节点记录可设置。"
+        sleep 1.5
+        return
+    fi
+
+    clear
+    echo "==================================================="
+    echo "              请选择要设置有效期的节点             "
+    echo "==================================================="
+
+    local -a tags_array=()
+    local -a expires_array=()
+    local -a paused_array=()
+    local -a pause_reasons_array=()
+    local line state expiry_text pause_reason
+    local i=1
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        parse_link_record "$line"
+        if jq -e --arg t "$RECORD_TAG" '.inbounds[] | select(.tag == $t)' "$CONF_FILE" >/dev/null 2>&1; then
+            state="运行中"
+            paused_array[$i]=0
+            pause_reasons_array[$i]=""
+        elif jq -e --arg t "$RECORD_TAG" 'has($t)' "$PAUSED_DB" >/dev/null 2>&1; then
+            pause_reason=$(jq -r --arg t "$RECORD_TAG" '.[$t].reason // "expired"' "$PAUSED_DB")
+            if [[ "$pause_reason" == "manual" ]]; then
+                state="手动暂停"
+            else
+                state="到期暂停"
+            fi
+            paused_array[$i]=1
+            pause_reasons_array[$i]="$pause_reason"
+        else
+            continue
+        fi
+        expiry_text=$(format_expiry "$RECORD_EXPIRES_AT")
+        echo "  $i) $RECORD_TAG [$state | $expiry_text]"
+        tags_array[$i]="$RECORD_TAG"
+        expires_array[$i]="$RECORD_EXPIRES_AT"
+        ((i++))
+    done < "$LINK_DB"
+
+    if [[ ${#tags_array[@]} -eq 0 ]]; then
+        warn "未检测到可设置的有效节点。"
+        sleep 1.5
+        return
+    fi
+
+    echo "  0) 返回主菜单"
+    echo "==================================================="
+    local sel
+    while true; do
+        read -r -p "请输入节点序号 [0-$((i-1))]: " sel </dev/tty
+        [[ "$sel" == "0" ]] && return
+        if [[ "$sel" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel < i )); then
+            break
+        fi
+        err "输入的序号无效，请重新输入。"
+    done
+
+    ask_for_expiry
+    local tag="${tags_array[$sel]}"
+    local expires_at=$RET_EXPIRES_AT
+
+    if [[ "${paused_array[$sel]}" == "1" && "${pause_reasons_array[$sel]}" != "manual" ]]; then
+        rewrite_link_expiry "$tag" "$expires_at"
+        if ! resume_node "$tag"; then
+            rewrite_link_expiry "$tag" "${expires_array[$sel]}"
+            sleep 1.5
+            return
+        fi
+        info "节点 [$tag] 已恢复运行。"
+    else
+        rewrite_link_expiry "$tag" "$expires_at"
+        if [[ "${paused_array[$sel]}" == "1" ]]; then
+            info "节点 [$tag] 保持手动暂停，可在节点状态菜单中启动。"
+        fi
+    fi
+    info "节点 [$tag] 的有效期已设置为: $(format_expiry "$expires_at")"
+    read -r -p "➤ 按回车键继续..." </dev/tty
+)
+
+manage_node_state() (
+    exec 9> "$CONF_DIR/node-state.lock"
+    flock 9
+
+    if [[ ! -s "$LINK_DB" ]]; then
+        warn "当前无节点记录可管理。"
+        sleep 1.5
+        return
+    fi
+
+    clear
+    echo "==================================================="
+    echo "                请选择要操作的节点                 "
+    echo "==================================================="
+
+    local -a tags_array=()
+    local -a expires_array=()
+    local -a active_array=()
+    local line state expiry_text pause_reason
+    local i=1
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        parse_link_record "$line"
+        [[ -n "$RECORD_TAG" ]] || continue
+
+        if jq -e --arg t "$RECORD_TAG" '.inbounds[] | select(.tag == $t)' "$CONF_FILE" >/dev/null 2>&1; then
+            state="运行中"
+            active_array[$i]=1
+        elif jq -e --arg t "$RECORD_TAG" 'has($t)' "$PAUSED_DB" >/dev/null 2>&1; then
+            pause_reason=$(jq -r --arg t "$RECORD_TAG" '.[$t].reason // "expired"' "$PAUSED_DB")
+            if [[ "$pause_reason" == "manual" ]]; then
+                state="手动暂停"
+            else
+                state="到期暂停"
+            fi
+            active_array[$i]=0
+        else
+            continue
+        fi
+
+        expiry_text=$(format_expiry "$RECORD_EXPIRES_AT")
+        echo "  $i) $RECORD_TAG [$state | $expiry_text]"
+        tags_array[$i]="$RECORD_TAG"
+        expires_array[$i]="$RECORD_EXPIRES_AT"
+        ((i++))
+    done < "$LINK_DB"
+
+    if [[ ${#tags_array[@]} -eq 0 ]]; then
+        warn "未检测到可管理的有效节点。"
+        sleep 1.5
+        return
+    fi
+
+    echo "  0) 返回主菜单"
+    echo "==================================================="
+    local sel
+    while true; do
+        read -r -p "请输入节点序号 [0-$((i-1))]: " sel </dev/tty
+        [[ "$sel" == "0" ]] && return
+        if [[ "$sel" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel < i )); then
+            break
+        fi
+        err "输入的序号无效，请重新输入。"
+    done
+
+    local tag="${tags_array[$sel]}"
+    local expires_at="${expires_array[$sel]}"
+    if [[ "${active_array[$sel]}" == "1" ]]; then
+        local confirm
+        read -r -p "确认暂停节点 [$tag]？(y/N): " confirm </dev/tty
+        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+            info "已取消。"
+            return
+        fi
+        pause_nodes_unlocked manual "$tag"
+    else
+        if [[ "$expires_at" =~ ^[0-9]+$ ]] && \
+           (( expires_at > 0 && expires_at <= $(date +%s) )); then
+            err "节点 [$tag] 已过期，请先在菜单 [15] 中续期，再启动。"
+            read -r -p "➤ 按回车键继续..." </dev/tty
+            return
+        fi
+        if resume_node "$tag"; then
+            info "节点 [$tag] 已启动。"
+        else
+            sleep 1.5
+            return
+        fi
+    fi
+
+    read -r -p "➤ 按回车键继续..." </dev/tty
+)
+
+delete_node() (
+    exec 9> "$CONF_DIR/node-state.lock"
+    flock 9
+
     if [[ ! -s "$LINK_DB" ]]; then
         warn "当前无节点记录可删除。"
         sleep 1.5
@@ -916,11 +1513,14 @@ delete_node() {
     
     local -a tags_array=()
     local i=1
-    while IFS="|" read -r tag link; do
-        if [[ "$tag" == SS-Internal-* ]]; then continue; fi
-        if jq -e --arg t "$tag" '.inbounds[] | select(.tag == $t)' "$CONF_FILE" >/dev/null 2>&1; then
-            echo "  $i) $tag"
-            tags_array[$i]="$tag"
+    local line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        parse_link_record "$line"
+        if [[ "$RECORD_TAG" == SS-Internal-* ]]; then continue; fi
+        if jq -e --arg t "$RECORD_TAG" '.inbounds[] | select(.tag == $t)' "$CONF_FILE" >/dev/null 2>&1 || \
+           jq -e --arg t "$RECORD_TAG" 'has($t)' "$PAUSED_DB" >/dev/null 2>&1; then
+            echo "  $i) $RECORD_TAG"
+            tags_array[$i]="$RECORD_TAG"
             ((i++))
         fi
     done < "$LINK_DB"
@@ -961,6 +1561,7 @@ delete_node() {
 
         if sing-box check -c "$tmp_conf" >/dev/null 2>&1; then
             mv "$tmp_conf" "$CONF_FILE"
+            chmod 600 "$CONF_FILE" 2>/dev/null || true
             systemctl restart sing-box || true
             sleep 1
             
@@ -969,7 +1570,7 @@ delete_node() {
                 mv "${CONF_FILE}.bak" "$CONF_FILE"
                 systemctl restart sing-box || true
             else
-                sed -i "/^$t|/d" "$LINK_DB" 2>/dev/null || true
+                remove_link_record "$t"
                 rm -f "${CONF_FILE}.bak"
                 info "节点 [\033[33m$t\033[0m] 已被彻底移除。"
                 read -r -p "➤ 按回车键继续..." </dev/tty
@@ -979,11 +1580,24 @@ delete_node() {
             rm -f "$tmp_conf" "${CONF_FILE}.bak"
             sleep 1.5
         fi
+    elif jq -e --arg tag "$t" 'has($tag)' "$PAUSED_DB" >/dev/null 2>&1; then
+        local tmp_paused="${PAUSED_DB}.tmp"
+        if jq --arg tag "$t" 'del(.[$tag])' "$PAUSED_DB" > "$tmp_paused"; then
+            chmod 600 "$tmp_paused" 2>/dev/null || true
+            mv "$tmp_paused" "$PAUSED_DB"
+            remove_link_record "$t"
+            info "暂停节点 [\033[33m$t\033[0m] 已被彻底移除。"
+            read -r -p "➤ 按回车键继续..." </dev/tty
+        else
+            rm -f "$tmp_paused"
+            err "暂停节点数据库更新失败。"
+            sleep 1.5
+        fi
     else
         warn "节点配置异常丢失，请检查 config.json。"
         sleep 1.5
     fi
-}
+)
 
 uninstall_core() {
     echo -e "\033[31m⚠️ 警告：这将彻底抹除 Sing-box 配置、证书、运行库与系统级守护进程。\033[0m"
@@ -996,6 +1610,8 @@ uninstall_core() {
     
     systemctl stop sing-box >/dev/null 2>&1 || true
     systemctl disable sing-box >/dev/null 2>&1 || true
+    systemctl disable --now sing-box-node-expiry.timer >/dev/null 2>&1 || true
+    rm -f "$EXPIRY_SERVICE" "$EXPIRY_TIMER" "$EXPIRY_HELPER"
     
     local bin_path
     bin_path=$(command -v sing-box || true)
@@ -1052,12 +1668,14 @@ main_menu() {
     echo " 12) 一键部署 ShadowTLS"
     echo " 13) 查看所有节点"
     echo " 14) 删除指定节点"
-    echo " 15) 完全卸载"
+    echo " 15) 编辑节点有效期"
+    echo " 16) 暂停/启动指定节点"
+    echo " 17) 完全卸载"
     echo "  0) 退出脚本"
     echo "==================================================="
     
     local choice
-    read -r -p "请输入序号 [0-15]: " choice </dev/tty
+    read -r -p "请输入序号 [0-17]: " choice </dev/tty
     case "$choice" in
         1) 
             install_singbox 
@@ -1114,6 +1732,12 @@ main_menu() {
             if check_singbox_installed; then delete_node; fi
             ;;
         15) 
+            if check_singbox_installed; then set_node_expiry; fi
+            ;;
+        16) 
+            if check_singbox_installed; then manage_node_state; fi
+            ;;
+        17) 
             uninstall_core 
             read -r -p "➤ 按回车键返回..." </dev/tty 
             ;;
@@ -1129,6 +1753,19 @@ main_menu() {
 
 if [[ $EUID -ne 0 ]]; then die "权限不足：请使用 root 权限。"; fi
 
+if [[ "${1:-}" == "--pause-expired" ]]; then
+    if [[ -s "$CONF_FILE" && -e "$LINK_DB" && -s "$PAUSED_DB" ]] && check_singbox_installed; then
+        pause_expired_nodes
+    fi
+    exit 0
+fi
+
 init_env 
+
+if command -v sing-box >/dev/null 2>&1; then
+    require_cmd flock
+    setup_expiry_timer
+    pause_expired_nodes || true
+fi
 
 while true; do main_menu; done
