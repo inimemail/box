@@ -100,6 +100,35 @@ check_singbox_installed() {
     return 0
 }
 
+get_core_status() {
+    local service_state version
+
+    CORE_VERSION="-"
+    if ! command -v sing-box >/dev/null 2>&1; then
+        CORE_STATUS="\033[31m未安装\033[0m"
+        return
+    fi
+
+    version=$(sing-box version 2>/dev/null | awk 'NR == 1 { print $3 }' || true)
+    CORE_VERSION=${version:-未知}
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        CORE_STATUS="\033[33m已安装（无法检测服务）\033[0m"
+        return
+    fi
+
+    service_state=$(systemctl is-active sing-box 2>/dev/null || true)
+    case "$service_state" in
+        active)       CORE_STATUS="\033[32m运行中\033[0m" ;;
+        inactive)     CORE_STATUS="\033[33m已停止\033[0m" ;;
+        activating)   CORE_STATUS="\033[33m启动中\033[0m" ;;
+        deactivating) CORE_STATUS="\033[33m停止中\033[0m" ;;
+        failed)       CORE_STATUS="\033[31m运行失败\033[0m" ;;
+        unknown)      CORE_STATUS="\033[33m已安装（服务未配置）\033[0m" ;;
+        *)            CORE_STATUS="\033[33m已安装（状态未知）\033[0m" ;;
+    esac
+}
+
 check_singbox_version() {
     local required=$1
     local ver_str
@@ -1648,11 +1677,13 @@ uninstall_core() {
 
 # ================= 交互菜单 =================
 main_menu() {
+    get_core_status
     clear
     echo "==================================================="
     echo "                 Sing-box 一键管理                 "
     echo "==================================================="
     echo -e " 核心配置: \033[36m$CONF_FILE\033[0m"
+    echo -e " 核心状态: $CORE_STATUS    版本: \033[36m$CORE_VERSION\033[0m"
     echo "---------------------------------------------------"
     echo "  1) 安装/更新 Sing-box 内核与依赖"
     echo "  2) 一键部署 VLESS-Reality"
