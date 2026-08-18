@@ -409,11 +409,13 @@ EOF
 
 # ================= ACME 自动化证书引擎 =================
 init_acme() {
+    local email_domain=${1:-example.com}
     if [[ ! -f "$ACME_DIR/acme.sh" ]]; then
         info "初始化 acme.sh 证书签发环境..."
-        fetch_public_ip
-        curl -s https://get.acme.sh | sh -s email="admin@${PUBLIC_IP}.com" >/dev/null 2>&1 || true
-        
+        if ! curl -fsSL --connect-timeout 10 --max-time 60 https://get.acme.sh | sh -s email="admin@${email_domain}" >/dev/null 2>&1; then
+            err "acme.sh 安装失败或网络超时，请改用其他证书方式。"
+            return 1
+        fi
         if [[ ! -x "$ACME_DIR/acme.sh" ]]; then
             err "acme.sh 安装彻底失败，请检查服务器网络连通性。"
             return 1
@@ -422,21 +424,90 @@ init_acme() {
     return 0
 }
 
+validate_cert_domain() {
+    local domain=$1
+    if [[ ! "$domain" =~ ^[A-Za-z0-9.-]+$ || "$domain" == .* || "$domain" == *. || "$domain" == *..* ]]; then
+        err "域名格式不合法: ${domain:-为空}"
+        return 1
+    fi
+    return 0
+}
+
+generate_self_signed_cert() {
+    local domain=$1
+    validate_cert_domain "$domain" || return 1
+    local crt_path="$CERT_DIR/${domain}.crt"
+    local key_path="$CERT_DIR/${domain}.key"
+    local tmp_crt="${crt_path}.tmp.$$"
+    local tmp_key="${key_path}.tmp.$$"
+    local tmp_conf="${crt_path}.openssl.tmp.$$"
+    local -a addext_args=()
+
+    # OpenSSL 1.1.1+ adds SAN directly; older versions use a temporary config.
+    if openssl req -help 2>&1 | grep -- '-addext' >/dev/null; then
+        addext_args=(-addext "subjectAltName=DNS:${domain}")
+    else
+        printf '%s\n' \
+            '[req]' \
+            'prompt = no' \
+            'distinguished_name = dn' \
+            'x509_extensions = v3_req' \
+            '[dn]' \
+            "CN = ${domain}" \
+            '[v3_req]' \
+            "subjectAltName = DNS:${domain}" > "$tmp_conf"
+    fi
+
+    local openssl_status=0
+    if (( ${#addext_args[@]} > 0 )); then
+        if openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
+            -keyout "$tmp_key" -out "$tmp_crt" -subj "/CN=${domain}" \
+            "${addext_args[@]}" >/dev/null 2>&1; then
+            :
+        else
+            openssl_status=$?
+        fi
+    else
+        if openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
+            -keyout "$tmp_key" -out "$tmp_crt" -config "$tmp_conf" \
+            -extensions v3_req >/dev/null 2>&1; then
+            :
+        else
+            openssl_status=$?
+        fi
+    fi
+    rm -f "$tmp_conf"
+    if (( openssl_status != 0 )); then
+        rm -f "$tmp_crt" "$tmp_key"
+        err "自签名证书生成失败。"
+        return 1
+    fi
+
+    chmod 600 "$tmp_key"
+    chmod 644 "$tmp_crt"
+    mv -f "$tmp_key" "$key_path"
+    mv -f "$tmp_crt" "$crt_path"
+    info "已生成自签名证书（有效期 3650 天）：$domain"
+    return 0
+}
+
 apply_cert() {
     local domain=$1
-    init_acme || return 1
-    local acme_bin="$ACME_DIR/acme.sh"
+    validate_cert_domain "$domain" || return 1
+    local crt_path="$CERT_DIR/${domain}.crt"
+    local key_path="$CERT_DIR/${domain}.key"
     
-    if [[ -s "$CERT_DIR/${domain}.crt" && -s "$CERT_DIR/${domain}.key" ]]; then
+    # 先检查本地证书，避免已有证书仍触发 acme.sh/ZeroSSL 联网操作。
+    if [[ -s "$crt_path" && -s "$key_path" ]]; then
         local cert_valid=false
-        if openssl x509 -noout -ext subjectAltName -in "$CERT_DIR/${domain}.crt" 2>/dev/null | grep -qi "$domain"; then
+        if openssl x509 -noout -ext subjectAltName -in "$crt_path" 2>/dev/null | grep -Fqi "$domain"; then
             cert_valid=true
-        elif openssl x509 -noout -subject -in "$CERT_DIR/${domain}.crt" 2>/dev/null | grep -qi "CN=$domain"; then
+        elif openssl x509 -noout -subject -in "$crt_path" 2>/dev/null | grep -Fqi "CN=$domain"; then
             cert_valid=true
         fi
 
         if $cert_valid; then
-            if openssl x509 -checkend 86400 -noout -in "$CERT_DIR/${domain}.crt" >/dev/null 2>&1; then
+            if openssl x509 -checkend 86400 -noout -in "$crt_path" >/dev/null 2>&1; then
                 info "证书状态健康且匹配，直接复用。"
                 return 0
             else
@@ -447,26 +518,47 @@ apply_cert() {
         fi
     fi
 
+    local cert_choice acme_server cert_label
+    echo "请选择证书方式 [$domain]:"
+    echo "  1) Let's Encrypt（推荐，免费）"
+    echo "  2) ZeroSSL（免费，需要 ACME 账户）"
+    echo "  3) 自签名证书（无需公网解析，客户端需跳过校验）"
+    while true; do
+        read -r -p "请选择 [1-3，回车默认 1]: " cert_choice </dev/tty
+        case "${cert_choice:-1}" in
+            1) acme_server="letsencrypt"; cert_label="Let's Encrypt"; break ;;
+            2) acme_server="zerossl"; cert_label="ZeroSSL"; break ;;
+            3) generate_self_signed_cert "$domain"; return $? ;;
+            *) err "输入错误，请选择 1、2 或 3。" ;;
+        esac
+    done
+
     if ss -tuln | grep ":80 " >/dev/null 2>&1; then
-        err "本机 80 端口被占用，Standalone 模式被拦截。请停止占用服务后重试。"
+        err "本机 80 端口被占用，Standalone 模式被拦截。请停止占用服务后重试，或改用自签名证书。"
         return 1
     fi
 
-    info "正在与 Let's Encrypt 握手 ($domain)..."
-    "$acme_bin" --issue -d "$domain" --standalone -k ec-256 --force || {
-        err "签发阻断，请核实 DNS A记录是否命中本机 IP。"
+    init_acme "$domain" || return 1
+    local acme_bin="$ACME_DIR/acme.sh"
+
+    info "正在使用 ${cert_label} 签发证书 ($domain)..."
+    if [[ "$acme_server" == "zerossl" ]]; then
+        "$acme_bin" --register-account -m "admin@${domain}" --server "$acme_server" >/dev/null 2>&1 || true
+    fi
+    "$acme_bin" --issue --server "$acme_server" -d "$domain" --standalone -k ec-256 --force || {
+        err "${cert_label} 签发失败，请核实 DNS A 记录、80 端口和网络连通性；也可重试选择自签名证书。"
         return 1
     }
     
-    "$acme_bin" --install-cert -d "$domain" --ecc \
-        --key-file "$CERT_DIR/${domain}.key" \
-        --fullchain-file "$CERT_DIR/${domain}.crt" \
+    "$acme_bin" --install-cert --server "$acme_server" -d "$domain" --ecc \
+        --key-file "$key_path" \
+        --fullchain-file "$crt_path" \
         --reloadcmd "systemctl restart sing-box" >/dev/null 2>&1 || {
         err "证书部署挂载或内核热重载失败，链路状态保护触发。"
         return 1
     }
         
-    if [[ ! -s "$CERT_DIR/${domain}.crt" || ! -s "$CERT_DIR/${domain}.key" ]]; then
+    if [[ ! -s "$crt_path" || ! -s "$key_path" ]]; then
         err "证书物理级写入异常。"
         return 1
     fi
